@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtualenvs
+venv/
+.env/
+.ca_env/
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+
+# Generated analysis outputs
+results/
+sample_images/processed_images/
