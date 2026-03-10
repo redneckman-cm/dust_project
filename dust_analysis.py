@@ -294,57 +294,87 @@ def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
     return mask_roi, (int(cx), int(cy), half_side)
 
 
-def straighten_image(image_bgr, max_correction_deg=15.0):
+def straighten_and_crop_to_card(image_bgr, padding_px=40):
     """
-    Detect small camera tilt using probabilistic Hough lines on the image
-    and correct it with an affine rotation.
+    Detect the white target card using HSV segmentation, rotate the image to
+    make the card axis-aligned (grid lines horizontal/vertical) at ANY tilt
+    angle, then crop tightly to the card area.
 
-    Only corrects angles smaller than max_correction_deg to avoid large
-    misdetections. Returns (corrected_image, angle_applied_deg).
-    angle_applied_deg > 0 means the image was rotated clockwise.
+    Uses minAreaRect on the white card contour, so it works regardless of how
+    much the camera is tilted -- unlike Hough-line approaches that fail beyond
+    ~15 degrees.
+
+    Returns: (processed_image, correction_angle_deg)
+    Falls back to (original_image, 0.0) if the card cannot be detected.
     """
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-
     h, w = image_bgr.shape[:2]
-    min_line_len = max(w // 6, 100)
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180,
-        threshold=80,
-        minLineLength=min_line_len,
-        maxLineGap=20,
-    )
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
-    if lines is None:
+    # White/light-grey paper: low saturation, high brightness
+    white_mask = cv2.inRange(hsv,
+                             np.array([0,   0, 150], dtype=np.uint8),
+                             np.array([180, 80, 255], dtype=np.uint8))
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kern)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kern)
+
+    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("[straighten] Could not detect white target card -- skipping rotation/crop.")
         return image_bgr, 0.0
 
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        # Keep only nearly-horizontal lines
-        if abs(a) < 20:
-            angles.append(a)
-        elif abs(a) > 160:
-            angles.append(a - 180)
-
-    if len(angles) < 3:
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < h * w * 0.04:
+        print("[straighten] White area too small -- skipping rotation/crop.")
         return image_bgr, 0.0
 
-    skew = float(np.median(angles))   # positive → lines tilt CW; negative → tilt CCW
+    rect = cv2.minAreaRect(largest)
+    rect_angle = rect[2]   # in [-90, 0)
 
-    if abs(skew) < 0.1 or abs(skew) > max_correction_deg:
-        return image_bgr, 0.0
+    # minAreaRect angle is in [-90, 0).  Pick the candidate rotation that is
+    # closest to 0 (i.e. the smallest correction needed):
+    #   cand1 = rect_angle       (in [-90,  0))
+    #   cand2 = rect_angle + 90  (in [  0, 90))
+    # The one with the smaller absolute value is the actual tilt angle.
+    # A positive value means rotate CCW (getRotationMatrix2D convention).
+    cand1 = rect_angle
+    cand2 = rect_angle + 90.0
+    correction = cand1 if abs(cand1) <= abs(cand2) else cand2
 
-    # Rotate image by -skew to level horizontal lines
+    # Rotate the full image.  Expand canvas so no corners are clipped.
+    cos_a = abs(np.cos(np.radians(correction)))
+    sin_a = abs(np.sin(np.radians(correction)))
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
     center = (w / 2.0, h / 2.0)
-    M = cv2.getRotationMatrix2D(center, -skew, 1.0)
-    corrected = cv2.warpAffine(
-        image_bgr, M, (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-    return corrected, skew
+    M = cv2.getRotationMatrix2D(center, correction, 1.0)
+    M[0, 2] += (new_w - w) / 2.0
+    M[1, 2] += (new_h - h) / 2.0
+    rotated = cv2.warpAffine(image_bgr, M, (new_w, new_h),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(128, 128, 128))
+
+    # Detect the card in the rotated image and crop to its bounding box
+    rh, rw = rotated.shape[:2]
+    hsv2 = cv2.cvtColor(rotated, cv2.COLOR_BGR2HSV)
+    white_mask2 = cv2.inRange(hsv2,
+                              np.array([0,   0, 150], dtype=np.uint8),
+                              np.array([180, 80, 255], dtype=np.uint8))
+    white_mask2 = cv2.morphologyEx(white_mask2, cv2.MORPH_CLOSE, kern)
+    white_mask2 = cv2.morphologyEx(white_mask2, cv2.MORPH_OPEN, kern)
+    c2, _ = cv2.findContours(white_mask2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if c2:
+        lg2 = max(c2, key=cv2.contourArea)
+        if cv2.contourArea(lg2) > rh * rw * 0.04:
+            x, y, bw, bh = cv2.boundingRect(lg2)
+            x1 = max(0, x - padding_px)
+            y1 = max(0, y - padding_px)
+            x2 = min(rw, x + bw + padding_px)
+            y2 = min(rh, y + bh + padding_px)
+            rotated = rotated[y1:y2, x1:x2]
+
+    return rotated, correction
 
 
 # =========================
@@ -1023,12 +1053,11 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
 
 def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_override=None, debug=False,
                          sample_name=None, spin_step=None, timestamp_str=None,
-                         precomputed_mask_roi=None, precomputed_roi_params=None,
-                         rotation_angle=0.0):
+                         precomputed_mask_roi=None, precomputed_roi_params=None):
     """
     Process a single image:
-      - (optionally) straighten by rotation_angle degrees
-      - auto-detect square ROI from the colored disc, or use precomputed ROI
+      - straighten and crop to the white target card (per-image, any tilt angle)
+      - auto-detect square ROI from the colored disc
       - measure dust
       - compute a continuous dust_intensity metric from dust_score
       - save dust-highlight overlay
@@ -1039,14 +1068,8 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
     if image is None:
         raise RuntimeError(f"Could not read image: {img_path}")
 
-    # Apply straightening rotation if one was detected from the baseline
-    if abs(rotation_angle) > 0.05:
-        h, w = image.shape[:2]
-        center = (w / 2.0, h / 2.0)
-        M = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
-        image = cv2.warpAffine(image, M, (w, h),
-                               flags=cv2.INTER_LINEAR,
-                               borderMode=cv2.BORDER_REFLECT_101)
+    # Straighten and crop to the target card -- works at any tilt angle
+    image, _angle = straighten_and_crop_to_card(image)
 
     # Figure out base names / extensions
     base_name = os.path.basename(img_path)
@@ -1336,16 +1359,12 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
 
     baseline_image = load_image_any(baseline_path)
 
-    # Auto-detect and correct small camera tilt from the baseline image.
-    # The same rotation angle is applied to every image for consistency.
-    baseline_image, skew_angle = straighten_image(baseline_image)
-    if abs(skew_angle) > 0.1:
-        print(f"Auto-straighten: correcting {skew_angle:+.2f}deg tilt in all images.")
-    else:
-        print("Auto-straighten: no significant tilt detected.")
+    # Straighten and crop the baseline image the same way each processed image will be.
+    print("\nAuto-straightening baseline image...")
+    baseline_image, _angle = straighten_and_crop_to_card(baseline_image)
 
     # Auto-detect the ROI square from the baseline disc (square inscribed in disc).
-    # ROI is also re-detected per image in process_single_image so it tracks disc movement.
+    # Each processed image re-detects its own ROI to track disc movement between shots.
     print("\nAuto-detecting ROI from colored disc in baseline image...")
     baseline_mask, roi_params = find_roi_auto(baseline_image)
     print(f"ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
@@ -1380,8 +1399,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # ROI is auto-detected per image so it tracks disc movement between shots.
-        # Straightening rotation (detected from baseline) is applied consistently.
+        # Each image is individually straightened, cropped, and ROI-detected.
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1391,7 +1409,6 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             sample_name=sample_name,
             spin_step=spin_step,
             timestamp_str=run_timestamp,
-            rotation_angle=skew_angle,
         )
         results.append(res)
 
