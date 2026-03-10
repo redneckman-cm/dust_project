@@ -69,15 +69,24 @@ def load_image_any(img_path: str):
             )
         # NEF: decode RAW to 16-bit RGB, then downscale to 8-bit and convert to BGR for OpenCV
         with rawpy.imread(img_path) as raw:
+            flip = raw.sizes.flip          # read EXIF orientation before closing
             rgb16 = raw.postprocess(
-                use_camera_wb=True,      # honor camera white balance
-                no_auto_bright=True,     # avoid aggressive tone curve that boosts noise
-                output_bps=16,           # keep 16-bit internal, then downscale ourselves
-                gamma=(1, 1),            # linear gamma; we handle contrast later
+                use_camera_wb=True,        # honor camera white balance
+                no_auto_bright=True,       # avoid aggressive tone curve that boosts noise
+                output_bps=16,             # keep 16-bit internal, then downscale ourselves
+                gamma=(2.222, 4.5),        # sRGB gamma — matches how the eye expects images to look
+                user_flip=0,               # we apply rotation ourselves below
             )
         # Convert 16-bit RGB to 8-bit RGB, then to BGR for OpenCV
         rgb8 = (rgb16 / 256).astype(np.uint8)
         bgr = cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
+        # Apply EXIF/camera orientation (rawpy flip codes match LibRaw convention)
+        if flip == 3:
+            bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+        elif flip == 5:
+            bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif flip == 6:
+            bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
         return bgr
     else:
         img = cv2.imread(img_path)
@@ -329,7 +338,7 @@ def find_roi_user_guided(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
                 loupe = cv2.resize(
                     patch,
                     (int(patch.shape[1] * LOUPE_ZOOM), int(patch.shape[0] * LOUPE_ZOOM)),
-                    interpolation=cv2.INTER_NEAREST,
+                    interpolation=cv2.INTER_LINEAR,
                 )
                 lh, lw = loupe.shape[:2]
                 # Crosshair
@@ -707,7 +716,7 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
                 loupe = cv2.resize(
                     roi,
                     (int(roi.shape[1] * LOUPE_ZOOM), int(roi.shape[0] * LOUPE_ZOOM)),
-                    interpolation=cv2.INTER_NEAREST,
+                    interpolation=cv2.INTER_LINEAR,
                 )
                 lh, lw = loupe.shape[:2]
 
