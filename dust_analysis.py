@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.9"  # ROI nudge: wasd keys, zoomed crop, centered windows
+TOOL_VERSION = "0.6.0"  # Fixed global baseline yardstick; no per-image auto-adjust
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -1109,8 +1109,10 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
         return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
     else:
-        # Baseline-based dust detection using only brightness vs baseline
-        # with a large blur to remove smooth shading gradients.
+        # Baseline-based detection: simple absolute comparison to the baseline mean.
+        # No shading-correction blur — every pixel in the ROI is measured against
+        # the same fixed reference value (base_mean) so the "yardstick" is identical
+        # for every image in the batch.  A perfectly clean image returns 0 % dust.
         base_mean, base_std = baseline_stats
 
         if base_std < 1e-3:
@@ -1118,31 +1120,27 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
         gray_f = gray.astype(np.float32)
 
-        # Very large blur: estimate slow background shading over the disk
-        shade = cv2.GaussianBlur(gray_f, (51, 51), 0)
+        # Positive delta = pixel is darker than the baseline mean.
+        delta = base_mean - gray_f
 
-        # Flatten so a clean disk looks ~base_mean everywhere
-        corrected = gray_f - (shade - base_mean)
-
-        # Positive delta => darker than baseline
-        delta = base_mean - corrected
-
+        # Determine the darkness threshold (sigma-based default, or fixed override).
         k = BASELINE_SIGMA_K
         sigma_thresh = k * base_std
         abs_thresh = BASELINE_MIN_ABS_DELTA
         dark_thresh = max(sigma_thresh, abs_thresh)
 
-        # Allow a fixed, calibration-derived threshold to override the default.
+        # A calibration-derived fixed threshold always wins when supplied.
         if dark_thresh_override is not None:
-            dark_thresh = dark_thresh_override
+            dark_thresh = float(dark_thresh_override)
 
-                # "Dust" = pixels inside ROI that are significantly darker than baseline
+        # Dust = pixels inside ROI that are darker than the fixed threshold.
+        # No percentile fallback: a clean image genuinely returns 0 %.
         dust_mask = (delta > dark_thresh) & roi
 
         dust_binary = np.zeros_like(gray, dtype=np.uint8)
         dust_binary[dust_mask] = 255
 
-        # Light cleanup: remove tiny isolated specks
+        # Light cleanup: remove tiny isolated specks.
         kernel = np.ones((3, 3), np.uint8)
         dust_binary = cv2.morphologyEx(dust_binary, cv2.MORPH_OPEN, kernel)
         dust_binary = cv2.dilate(dust_binary, kernel, iterations=1)
@@ -1150,29 +1148,18 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         dust_pixels = np.count_nonzero(dust_binary == 255)
         dust_fraction = dust_pixels / float(total_pixels)
 
-        # Visualization score: normalized "how dark vs baseline" for all darker-than-baseline pixels.
-        # This is separate from the hard dust mask above.
+        # Visualization score: normalize to a FIXED scale so red intensity is
+        # consistent across the batch.  4 × threshold = full red; anything above
+        # is clamped.  This prevents a nearly-clean image from looking as red as
+        # a very dirty one just because both are normalized to their own maximum.
         delta_pos = delta.copy()
-        delta_pos[delta_pos < 0] = 0       # only darker-than-baseline
-        delta_pos[~roi] = 0               # zero outside ROI
-        max_delta = float(delta_pos.max())
-        if max_delta > 0:
-            dust_score = (delta_pos / max_delta).astype(np.float32)  # 0..1
+        delta_pos[delta_pos < 0] = 0
+        delta_pos[~roi] = 0
+        fixed_scale = dark_thresh * 4.0
+        if fixed_scale > 0:
+            dust_score = np.clip(delta_pos / fixed_scale, 0.0, 1.0).astype(np.float32)
         else:
             dust_score = np.zeros_like(delta_pos, dtype=np.float32)
-
-        return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
-
-        dust_binary = np.zeros_like(gray, dtype=np.uint8)
-        dust_binary[dust_mask] = 255
-
-        # Light cleanup: remove tiny isolated specks
-        kernel = np.ones((3, 3), np.uint8)
-        dust_binary = cv2.morphologyEx(dust_binary, cv2.MORPH_OPEN, kernel)
-        dust_binary = cv2.dilate(dust_binary, kernel, iterations=1)
-
-        dust_pixels = np.count_nonzero(dust_binary == 255)
-        dust_fraction = dust_pixels / float(total_pixels)
 
         return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
 
@@ -1183,10 +1170,10 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 def compute_baseline_dark_threshold(baseline_image_bgr, baseline_mask, baseline_stats, percentile=99.5):
     """Derive a fixed darkness threshold from the untreated baseline image.
 
-    We compute the same shaded-corrected gray as in measure_dust, then look at
-    the distribution of (baseline_mean - corrected) inside the ROI. A high
-    percentile of that distribution becomes the darkness threshold such that
-    essentially all clean baseline pixels fall below it.
+    Uses the same simple delta = base_mean - gray as measure_dust (no shading
+    correction blur).  A high percentile of the positive-delta distribution
+    inside the baseline ROI gives a threshold that essentially all clean
+    pixels fall below.  Any sample pixel darker than this threshold is dust.
     """
     gray = cv2.cvtColor(baseline_image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     base_mean, base_std = baseline_stats
@@ -1194,11 +1181,8 @@ def compute_baseline_dark_threshold(baseline_image_bgr, baseline_mask, baseline_
     if base_std < 1e-3:
         base_std = 1.0
 
-    # Very large blur to estimate slow-varying shading
-    shade = cv2.GaussianBlur(gray, (51, 51), 0)
-    corrected = gray - (shade - base_mean)
-
-    delta = base_mean - corrected
+    # Simple absolute difference — mirrors measure_dust exactly.
+    delta = base_mean - gray
     roi = (baseline_mask == 255)
     delta_roi = delta[roi]
 
@@ -1891,10 +1875,18 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
     print(f"Baseline stats (gray mean, std): {baseline_stats[0]:.2f}, {baseline_stats[1]:.2f}")
 
-    # For now, do NOT force a global fixed darkness threshold.
-    # Let measure_dust use its default (k * sigma vs abs threshold) per image.
-    baseline_dark_thresh = None
-    print("Using per-image darkness threshold (no fixed baseline override).")
+    # Calibrate a fixed darkness threshold from the baseline image (the cleanest
+    # image in the batch — the "yardstick").  Every image in the batch uses the
+    # same threshold so sensitivity cannot auto-adjust as images get cleaner.
+    print("\nCalibrating fixed darkness threshold from baseline image...")
+    baseline_dark_thresh = compute_baseline_dark_threshold(
+        baseline_image, baseline_mask, baseline_stats
+    )
+    if baseline_dark_thresh is not None:
+        print(f"  Fixed threshold: {baseline_dark_thresh:.3f} gray levels above baseline mean")
+        print("  (applied to every image — a clean image will return 0 % dust)")
+    else:
+        print("  Warning: threshold calibration failed; falling back to per-image default.")
 
     out_root = "results"
     os.makedirs(out_root, exist_ok=True)
