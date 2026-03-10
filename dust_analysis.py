@@ -26,15 +26,18 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.3.0"  # dust-intensity metric + NEF support    
+TOOL_VERSION = "0.5.8"  # Per-image interactive ROI nudge (arrow keys)
 
 # =========================
 # GLOBAL TUNING CONSTANTS
 # =========================
 
-# How far inside detected edge the ROI sits (auto mode)
-AUTO_INNER_SCALE = 0.96     # smaller -> tighter circle inside edge
-INNER_SHRINK = 5            # extra pixels inward from scaled radius
+# User-guided ROI: pixels to shrink inward from each edge after corner clicks
+ROI_CORNER_SHRINK_PX = 5
+
+# Legacy auto-circle constants (kept for reference; auto-detect no longer used in main flow)
+AUTO_INNER_SCALE = 0.96
+INNER_SHRINK = 5
 
 # Only local-contrast pixels above this percentile (inside ROI) are dust
 DUST_PERCENTILE = 92.0      # higher -> fewer pixels marked as dust
@@ -66,15 +69,24 @@ def load_image_any(img_path: str):
             )
         # NEF: decode RAW to 16-bit RGB, then downscale to 8-bit and convert to BGR for OpenCV
         with rawpy.imread(img_path) as raw:
+            flip = raw.sizes.flip          # read EXIF orientation before closing
             rgb16 = raw.postprocess(
-                use_camera_wb=True,      # honor camera white balance
-                no_auto_bright=True,     # avoid aggressive tone curve that boosts noise
-                output_bps=16,           # keep 16-bit internal, then downscale ourselves
-                gamma=(1, 1),            # linear gamma; we handle contrast later
+                use_camera_wb=True,        # honor camera white balance
+                no_auto_bright=True,       # avoid aggressive tone curve that boosts noise
+                output_bps=16,             # keep 16-bit internal, then downscale ourselves
+                gamma=(2.222, 4.5),        # sRGB gamma — matches how the eye expects images to look
+                user_flip=0,               # we apply rotation ourselves below
             )
         # Convert 16-bit RGB to 8-bit RGB, then to BGR for OpenCV
         rgb8 = (rgb16 / 256).astype(np.uint8)
         bgr = cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
+        # Apply EXIF/camera orientation (rawpy flip codes match LibRaw convention)
+        if flip == 3:
+            bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+        elif flip == 5:
+            bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif flip == 6:
+            bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
         return bgr
     else:
         img = cv2.imread(img_path)
@@ -208,6 +220,782 @@ def find_ring_mask_auto(image_bgr, inner_fraction: float = 0.44, inner_shrink: i
 
     return mask_roi, (int(cx), int(cy), int(r_roi))
 
+
+# =========================
+# DISC DETECTION HELPER
+# =========================
+
+def _find_disc_center(image_bgr):
+    """
+    Locate the coloured filter disc (orange / yellow / green / pink) in image_bgr.
+
+    Uses HSV colour segmentation across multiple colour ranges, then applies a
+    circularity filter  (circularity = 4*pi*area / perimeter^2 > 0.45)  to
+    reject elongated tape strips that share the disc's hue but are not circular.
+
+    Returns: (cx, cy, r)  -- centre x, centre y, and radius in pixels (floats)
+    Raises:  RuntimeError if no sufficiently circular blob is found.
+    """
+    h, w = image_bgr.shape[:2]
+    min_dim = min(h, w)
+    img_cx, img_cy = w / 2.0, h / 2.0
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    color_ranges = [
+        (np.array([15, 80, 80],  dtype=np.uint8), np.array([40, 255, 255], dtype=np.uint8)),  # yellow/orange
+        (np.array([5,  80, 80],  dtype=np.uint8), np.array([20, 255, 255], dtype=np.uint8)),  # orange
+        (np.array([40, 40, 40],  dtype=np.uint8), np.array([80, 255, 255], dtype=np.uint8)),  # green
+        (np.array([160, 60, 60], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8)), # pink/red
+        (np.array([0,  60, 60],  dtype=np.uint8), np.array([10, 255, 255], dtype=np.uint8)),  # pink/red wrap
+    ]
+
+    best = None
+    best_score = -1e9
+    kernel = np.ones((5, 5), np.uint8)
+
+    for lower, upper in color_ranges:
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < (min_dim * min_dim * 0.002):
+                continue
+
+            # --- circularity filter: rejects tape strips and other elongated blobs ---
+            perimeter = cv2.arcLength(c, True)
+            if perimeter < 1:
+                continue
+            circularity = 4.0 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.45:
+                continue  # not round enough -- skip
+
+            (cx_c, cy_c), r_c = cv2.minEnclosingCircle(c)
+            cx_c, cy_c, r_c = float(cx_c), float(cy_c), float(r_c)
+
+            if not (min_dim * 0.04 < r_c < min_dim * 0.55):
+                continue
+
+            # Soft penalty for being far from image centre
+            dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
+            score = area - (dc * 3000.0)
+
+            if score > best_score:
+                best_score = score
+                best = (cx_c, cy_c, r_c)
+
+    if best is None:
+        raise RuntimeError(
+            "_find_disc_center: could not detect a circular coloured disc. "
+            "Check that the sample is visible and not obscured by tape or other objects."
+        )
+
+    return best  # (cx, cy, r)
+
+
+# =========================
+# AUTO-DETECT SQUARE ROI FROM GRID
+# =========================
+
+def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+    """
+    Detect the ROI square from the printed black grid lines on the target card.
+
+    Strategy: morphological line detection + run-width filtering.
+
+    1. Threshold at 50 to isolate near-black ink (sRGB black ink < 30,
+       dark metallic surfaces typically > 60 after gamma).
+    2. Mask out the outer 5 % border so metallic frame edges are ignored.
+    3. MORPH_OPEN with a long horizontal kernel --> keeps only long horizontal
+       strokes; short blobs and vertical features are erased.
+       MORPH_OPEN with a long vertical kernel   --> keeps only long vertical
+       strokes; short blobs and horizontal features are erased.
+    4. Project each result onto its axis (count dark pixels per row/column).
+    5. Group consecutive dark rows/columns into "runs":
+         - NARROW runs (a few px wide) = printed grid lines   --> keep
+         - WIDE runs  (many px tall)   = dark background bands --> discard
+    6. The outermost surviving narrow runs define the grid outer boundary = ROI.
+
+    Returns: (mask_roi uint8 0/255, (cx, cy, half_side))
+    Raises:  RuntimeError if at least 2 H-lines + 2 V-lines cannot be found.
+    """
+    h, w = image_bgr.shape[:2]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # --- Step 1: threshold ---
+    # Use 70 (generous) so Sharpie ink is captured even where the disc sits on
+    # top of it.  Fine metallic lines are kept too, but the run-width filter
+    # below removes them.
+    _, dark = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+
+    # --- Step 2: ignore the outer border strip (prevents metallic rim detections) ---
+    bdr = max(10, int(min(h, w) * 0.05))
+    dark[:bdr, :] = 0
+    dark[-bdr:, :] = 0
+    dark[:, :bdr] = 0
+    dark[:, -bdr:] = 0
+
+    # --- Step 3: morphological line extraction ---
+    # Sharpie lines can be partially hidden by the disc, so use a shorter
+    # minimum length (1/8 of dimension) to catch even broken segments.
+    h_len = max(20, w // 8)
+    v_len = max(20, h // 8)
+    horiz = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1)))
+    vert  = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len)))
+
+    # --- Step 4: row/column projections ---
+    h_count = np.count_nonzero(horiz, axis=1)   # dark pixels per row
+    v_count = np.count_nonzero(vert,  axis=0)   # dark pixels per column
+
+    h_rows = np.where(h_count > w * 0.05)[0]    # 5%: catches partially-visible lines
+    v_cols = np.where(v_count > h * 0.05)[0]
+
+    # --- Step 5: run-width band-pass filter ---
+    # The Sharpie marker makes THICK lines.  Fine metallic lines are thin.
+    # Dark metallic background bands are very wide.
+    #
+    #   run width < MIN_PX  --> fine metallic line  --> discard
+    #   MIN_PX <= run <= MAX_PX --> Sharpie grid line --> KEEP
+    #   run width > MAX_PX  --> dark background band --> discard
+    #
+    # After the morphological OPEN each printed Sharpie line shows as a run
+    # of consecutive dark rows/columns a few to ~60 px wide.
+    MIN_LINE_PX = 4    # thinner than this = fine metallic line
+    MAX_LINE_PX = 80   # wider than this = dark background band
+
+    def _gridline_centers(positions):
+        if len(positions) == 0:
+            return []
+        lines = []
+        run = [int(positions[0])]
+        for p in positions[1:]:
+            if int(p) - run[-1] <= 3:
+                run.append(int(p))
+            else:
+                rw = run[-1] - run[0] + 1
+                if MIN_LINE_PX <= rw <= MAX_LINE_PX:
+                    lines.append(int(round(np.mean(run))))
+                run = [int(p)]
+        rw = run[-1] - run[0] + 1
+        if MIN_LINE_PX <= rw <= MAX_LINE_PX:
+            lines.append(int(round(np.mean(run))))
+        return lines
+
+    h_lines = _gridline_centers(h_rows)
+    v_lines = _gridline_centers(v_cols)
+
+    if len(h_lines) < 2:
+        raise RuntimeError(
+            "find_roi_from_grid: fewer than 2 horizontal grid lines found. "
+            "Make sure the grid card is visible and the image is in focus."
+        )
+    if len(v_lines) < 2:
+        raise RuntimeError(
+            "find_roi_from_grid: fewer than 2 vertical grid lines found. "
+            "Make sure the grid card is visible and the image is in focus."
+        )
+
+    # --- Step 6: outer boundary of surviving narrow runs = grid square ---
+    y_top   = min(h_lines)
+    y_bot   = max(h_lines)
+    x_left  = min(v_lines)
+    x_right = max(v_lines)
+
+    # Sanity: grid must be a meaningful portion of the image
+    if (y_bot - y_top) < h * 0.10 or (x_right - x_left) < w * 0.10:
+        raise RuntimeError(
+            f"find_roi_from_grid: detected grid region too small "
+            f"({x_right - x_left}x{y_bot - y_top} px in {w}x{h} image). "
+            "Check that the full grid is in frame."
+        )
+
+    # Shrink inward past the line pixels themselves
+    y_top   = min(h - 1, y_top   + shrink)
+    y_bot   = max(0,     y_bot   - shrink)
+    x_left  = min(w - 1, x_left  + shrink)
+    x_right = max(0,     x_right - shrink)
+
+    cx_roi    = (x_left + x_right) // 2
+    cy_roi    = (y_top  + y_bot)   // 2
+    half_side = min((x_right - x_left) // 2, (y_bot - y_top) // 2)
+
+    mask_roi = np.zeros((h, w), dtype=np.uint8)
+    mask_roi[y_top : y_bot + 1, x_left : x_right + 1] = 255
+
+    return mask_roi, (cx_roi, cy_roi, half_side)
+
+
+def straighten_and_crop_to_card(image_bgr, padding_px=40):
+    """
+    Detect the white target card, rotate the image so grid lines are
+    horizontal/vertical at ANY tilt angle, then crop tightly to the card.
+
+    Key improvement over the previous version: card selection is ANCHORED to
+    the disc location.  After finding the disc with _find_disc_center(), we
+    pick the white contour that CONTAINS the disc centre (pointPolygonTest)
+    rather than blindly choosing the largest white blob.  This prevents shiny
+    metallic surfaces from being mistaken for the paper target card.
+
+    Steps:
+      1. Find disc centre with _find_disc_center().
+      2. HSV-segment white/light-grey areas.
+      3. Select the white contour that contains the disc centre.
+         Fall back to largest contour if none contains the disc.
+      4. Rotate by minAreaRect angle -- works at any tilt.
+      5. Crop to card bounding box in the rotated image (disc-anchored again).
+
+    Returns: (processed_image, correction_angle_deg)
+    Falls back to (original_image, 0.0) if the card cannot be detected.
+    """
+    h, w = image_bgr.shape[:2]
+
+    # --- Step 1: locate disc ---
+    try:
+        disc_cx, disc_cy, _disc_r = _find_disc_center(image_bgr)
+    except RuntimeError as exc:
+        print(f"[straighten] {exc} -- skipping rotation/crop.")
+        return image_bgr, 0.0
+
+    # --- Step 2: find white/light-grey regions ---
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    white_mask = cv2.inRange(hsv,
+                             np.array([0,   0, 150], dtype=np.uint8),
+                             np.array([180, 80, 255], dtype=np.uint8))
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kern)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kern)
+
+    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("[straighten] Could not detect white target card -- skipping rotation/crop.")
+        return image_bgr, 0.0
+
+    # --- Step 3: pick white contour that contains the disc centre ---
+    disc_pt = (float(disc_cx), float(disc_cy))
+    card_contour = None
+    large_contours = [c for c in contours if cv2.contourArea(c) >= h * w * 0.04]
+
+    for c in large_contours:
+        if cv2.pointPolygonTest(c, disc_pt, False) >= 0:
+            card_contour = c
+            break
+
+    if card_contour is None:
+        if not large_contours:
+            print("[straighten] No large white region found -- skipping rotation/crop.")
+            return image_bgr, 0.0
+        card_contour = max(large_contours, key=cv2.contourArea)
+        print("[straighten] Disc centre not inside any white region; using largest white blob.")
+
+    # --- Step 4: compute rotation angle and rotate ---
+    rect = cv2.minAreaRect(card_contour)
+    rect_angle = rect[2]   # in [-90, 0)
+
+    # Pick the candidate rotation closest to 0 (smallest absolute correction)
+    cand1 = rect_angle
+    cand2 = rect_angle + 90.0
+    correction = cand1 if abs(cand1) <= abs(cand2) else cand2
+
+    cos_a = abs(np.cos(np.radians(correction)))
+    sin_a = abs(np.sin(np.radians(correction)))
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, correction, 1.0)
+    M[0, 2] += (new_w - w) / 2.0
+    M[1, 2] += (new_h - h) / 2.0
+    rotated = cv2.warpAffine(image_bgr, M, (new_w, new_h),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(128, 128, 128))
+
+    # --- Step 5: crop to card in rotated image (disc-anchored) ---
+    rh, rw = rotated.shape[:2]
+    hsv2 = cv2.cvtColor(rotated, cv2.COLOR_BGR2HSV)
+    white_mask2 = cv2.inRange(hsv2,
+                              np.array([0,   0, 150], dtype=np.uint8),
+                              np.array([180, 80, 255], dtype=np.uint8))
+    white_mask2 = cv2.morphologyEx(white_mask2, cv2.MORPH_CLOSE, kern)
+    white_mask2 = cv2.morphologyEx(white_mask2, cv2.MORPH_OPEN, kern)
+    c2, _ = cv2.findContours(white_mask2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Transform disc centre into rotated-image coordinates
+    disc_rot = M @ np.array([disc_cx, disc_cy, 1.0])
+    disc_rx, disc_ry = float(disc_rot[0]), float(disc_rot[1])
+    disc_pt2 = (disc_rx, disc_ry)
+
+    crop_contour = None
+    if c2:
+        large2 = [c for c in c2 if cv2.contourArea(c) >= rh * rw * 0.04]
+        for c in large2:
+            if cv2.pointPolygonTest(c, disc_pt2, False) >= 0:
+                crop_contour = c
+                break
+        if crop_contour is None and large2:
+            crop_contour = max(large2, key=cv2.contourArea)
+
+    if crop_contour is not None:
+        x, y, bw, bh = cv2.boundingRect(crop_contour)
+        x1 = max(0, x - padding_px)
+        y1 = max(0, y - padding_px)
+        x2 = min(rw, x + bw + padding_px)
+        y2 = min(rh, y + bh + padding_px)
+        rotated = rotated[y1:y2, x1:x2]
+
+    return rotated, correction
+
+
+# =========================
+# ROTATION HELPERS
+# =========================
+
+def apply_rotation(image_bgr, angle_deg):
+    """
+    Rotate image_bgr by angle_deg (positive = CCW in OpenCV convention).
+    Canvas is expanded so no pixel content is clipped.
+    Returns the rotated image unchanged if angle is essentially zero.
+    """
+    if abs(angle_deg) < 0.001:
+        return image_bgr
+    h, w = image_bgr.shape[:2]
+    cos_a = abs(np.cos(np.radians(angle_deg)))
+    sin_a = abs(np.sin(np.radians(angle_deg)))
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+    M[0, 2] += (new_w - w) / 2.0
+    M[1, 2] += (new_h - h) / 2.0
+    return cv2.warpAffine(image_bgr, M, (new_w, new_h),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=(128, 128, 128))
+
+
+def interactive_rotation(image_bgr):
+    """
+    Show the image in an interactive window and let the user rotate it with
+    keyboard keys until the grid lines are perfectly horizontal/vertical.
+    The confirmed angle is then applied to every image in the batch.
+
+    Keys:
+        a  /  Left  arrow  --  rotate CCW  1.0 deg
+        d  /  Right arrow  --  rotate  CW  1.0 deg
+        z  /  ,            --  rotate CCW  0.1 deg  (fine)
+        x  /  .            --  rotate  CW  0.1 deg  (fine)
+        r                  --  reset to 0 deg
+        Enter              --  confirm and use this angle
+        q                  --  cancel (use 0 deg, no rotation)
+
+    Returns: angle_deg (float, positive = CCW correction applied to every image)
+    """
+    WIN = "Straighten -- a/d to rotate  z/x for fine  r=reset  Enter=confirm  q=cancel"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+
+    h, w = image_bgr.shape[:2]
+    MAX_W, MAX_H = 1400, 900
+    scale = min(MAX_W / w, MAX_H / h, 1.0)
+    disp_w = max(1, int(w * scale))
+    disp_h = max(1, int(h * scale))
+
+    angle = 0.0
+
+    # Pre-build the static alignment grid (never rotates -- fixed to the screen).
+    # Fine lines every ~step px; brighter centre crosshair for reference.
+    step = max(40, disp_h // 10)   # ~10 rows across the window height
+    grid_layer = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+    GRID_COLOR  = (0, 180, 180)   # dim cyan for minor grid lines
+    CROSS_COLOR = (0, 255, 255)   # bright cyan for centre crosshair
+    for gx in range(0, disp_w, step):
+        cv2.line(grid_layer, (gx, 0), (gx, disp_h - 1), GRID_COLOR, 1)
+    for gy in range(0, disp_h, step):
+        cv2.line(grid_layer, (0, gy), (disp_w - 1, gy), GRID_COLOR, 1)
+    # Centre crosshair (thicker + brighter)
+    cv2.line(grid_layer, (disp_w // 2, 0), (disp_w // 2, disp_h - 1), CROSS_COLOR, 2)
+    cv2.line(grid_layer, (0, disp_h // 2), (disp_w - 1, disp_h // 2), CROSS_COLOR, 2)
+
+    def _render(ang):
+        # Rotate the image content (the grid stays fixed on top)
+        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), ang, 1.0)
+        rot = cv2.warpAffine(image_bgr, M, (w, h),
+                             flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=(128, 128, 128))
+        disp = cv2.resize(rot, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+        # Blend static grid over the rotated image (40% opacity)
+        disp = cv2.addWeighted(disp, 1.0, grid_layer, 0.4, 0)
+
+        # Text overlay
+        lines = [
+            f"Angle: {ang:+.1f} deg  |  Align card lines to the cyan grid",
+            "a/Left: CCW 1deg   d/Right: CW 1deg",
+            "z/,: CCW 0.1deg    x/.: CW 0.1deg",
+            "r: reset   Enter: confirm   q: cancel (no rotation)",
+        ]
+        for i, txt in enumerate(lines):
+            y = 28 + i * 26
+            cv2.putText(disp, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+            cv2.putText(disp, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        return disp
+
+    cv2.imshow(WIN, _render(angle))
+    cv2.resizeWindow(WIN, disp_w, disp_h)
+
+    while True:
+        key = cv2.waitKey(0)
+        k = key & 0xFFFF  # keep 16 bits for macOS extended arrow key codes
+
+        if k in (13, 10):       # Enter / Return -- confirm
+            break
+        elif k == ord('q'):     # cancel -- no rotation
+            angle = 0.0
+            break
+        elif k == ord('r'):     # reset
+            angle = 0.0
+        elif k in (ord('a'), 81, 63234):   # 'a' or Left arrow (81=Win, 63234=Mac)
+            angle += 1.0    # CCW
+        elif k in (ord('d'), 83, 63235):   # 'd' or Right arrow (83=Win, 63235=Mac)
+            angle -= 1.0    # CW
+        elif k in (ord('z'), ord(',')):    # fine CCW
+            angle += 0.1
+        elif k in (ord('x'), ord('.')):    # fine CW
+            angle -= 0.1
+
+        cv2.imshow(WIN, _render(angle))
+
+    cv2.destroyWindow(WIN)
+    return round(angle, 1)
+
+
+# =========================
+# USER-GUIDED SQUARE ROI
+# =========================
+
+def find_roi_user_guided(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+    """
+    Interactive square ROI selection.
+
+    Shows the image in a resizable window and asks the user to click the
+    4 interior corners of the 1 cm x 1 cm square target (in any order).
+    A magnifier loupe assists with precise placement.
+
+    After 4 clicks the bounding rectangle is shrunk inward by `shrink`
+    pixels on every side and used as the ROI.
+
+    Press 'r' at any time to clear clicks and start over.
+    Press ENTER to confirm once all 4 corners have been clicked.
+
+    Returns:
+        mask_roi  – uint8 (h, w) array, 255 inside ROI, 0 outside
+        roi_params – (cx, cy, half_side) compatible with downstream helpers
+    """
+    h, w = image_bgr.shape[:2]
+
+    # Scale image to fit a reasonable display window
+    MAX_DISP_W, MAX_DISP_H = 1400, 900
+    scale = min(MAX_DISP_W / w, MAX_DISP_H / h, 1.0)
+    disp_w = int(w * scale)
+    disp_h = int(h * scale)
+    display_base = cv2.resize(image_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+    font_scale = max(0.5, min(1.2, disp_w / 1200.0))
+    line_spacing = int(30 * font_scale)
+
+    # Loupe magnifier settings
+    LOUPE_ZOOM = 4.0
+    LOUPE_HALF_SIZE = max(30, int(disp_w * 0.06))
+
+    instructions = [
+        "Click the 4 INTERIOR CORNERS of the 1cm x 1cm square ROI (any order).",
+        "Use the magnifier for precise placement. Press 'r' to restart.",
+        "Press ENTER after all 4 corners are clicked to confirm.",
+    ]
+
+    corners = []       # original-image coordinates
+    mouse_pos = None
+
+    window_name = "Select ROI – Click 4 corners of the square"
+
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal mouse_pos, corners
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_pos = (x, y)
+        elif event == cv2.EVENT_LBUTTONDOWN and len(corners) < 4:
+            orig_x = x / scale
+            orig_y = y / scale
+            corners.append((orig_x, orig_y))
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, mouse_callback)
+
+    while True:
+        disp = display_base.copy()
+
+        # Instructions
+        y_text = int(25 * font_scale)
+        for line in instructions:
+            cv2.putText(disp, line, (10, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (0, 255, 255), 2, cv2.LINE_AA)
+            y_text += line_spacing
+
+        # Click counter
+        count_color = (0, 255, 0) if len(corners) == 4 else (0, 200, 255)
+        cv2.putText(disp, f"Corners clicked: {len(corners)} / 4",
+                    (10, disp_h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                    count_color, 2, cv2.LINE_AA)
+
+        # Draw clicked corners
+        for i, (ox, oy) in enumerate(corners):
+            dx = int(ox * scale)
+            dy = int(oy * scale)
+            cv2.drawMarker(disp, (dx, dy), (0, 0, 255),
+                           cv2.MARKER_CROSS, 20, 2)
+            cv2.putText(disp, str(i + 1), (dx + 8, dy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+
+        # Preview rectangle once all 4 corners are in
+        if len(corners) == 4:
+            pts_dx = [int(c[0] * scale) for c in corners]
+            pts_dy = [int(c[1] * scale) for c in corners]
+            rx0d, rx1d = min(pts_dx), max(pts_dx)
+            ry0d, ry1d = min(pts_dy), max(pts_dy)
+            s_d = max(0, int(shrink * scale))
+            cv2.rectangle(disp,
+                          (rx0d + s_d, ry0d + s_d),
+                          (rx1d - s_d, ry1d - s_d),
+                          (255, 0, 0), 2)
+            cv2.putText(disp, "Blue = final ROI (shrunk by 5 px). Press ENTER to confirm.",
+                        (10, disp_h - 15 - line_spacing),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (255, 200, 0), 2, cv2.LINE_AA)
+
+        # Magnifier loupe
+        if mouse_pos is not None:
+            mx, my = mouse_pos
+            x0l = max(mx - LOUPE_HALF_SIZE, 0)
+            y0l = max(my - LOUPE_HALF_SIZE, 0)
+            x1l = min(mx + LOUPE_HALF_SIZE, disp.shape[1] - 1)
+            y1l = min(my + LOUPE_HALF_SIZE, disp.shape[0] - 1)
+            patch = disp[y0l:y1l, x0l:x1l]
+            if patch.size > 0:
+                loupe = cv2.resize(
+                    patch,
+                    (int(patch.shape[1] * LOUPE_ZOOM), int(patch.shape[0] * LOUPE_ZOOM)),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                lh, lw = loupe.shape[:2]
+                # Crosshair
+                cv2.line(loupe, (lw // 2, 0), (lw // 2, lh - 1), (0, 0, 0), 3)
+                cv2.line(loupe, (0, lh // 2), (lw - 1, lh // 2), (0, 0, 0), 3)
+                # Placement
+                ox_l = mx + 20
+                oy_l = my + 20
+                if ox_l + lw > disp.shape[1]:
+                    ox_l = mx - lw - 20
+                if oy_l + lh > disp.shape[0]:
+                    oy_l = my - lh - 20
+                ox_l, oy_l = max(0, ox_l), max(0, oy_l)
+                # Circular blend mask
+                lmask = np.zeros((lh, lw, 3), dtype=np.float32)
+                lradius = min(lh, lw) // 2
+                cv2.circle(lmask, (lw // 2, lh // 2), lradius, (1.0, 1.0, 1.0), -1)
+                sub = disp[oy_l:oy_l + lh, ox_l:ox_l + lw].astype(np.float32)
+                blended = sub * (1.0 - lmask) + loupe.astype(np.float32) * lmask
+                disp[oy_l:oy_l + lh, ox_l:ox_l + lw] = blended.astype(np.uint8)
+                cv2.circle(disp,
+                           (ox_l + lw // 2, oy_l + lh // 2),
+                           lradius, (255, 255, 255), 1)
+
+        cv2.imshow(window_name, disp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == ord('r'):
+            corners = []
+
+        if key in (13, 10) and len(corners) == 4:   # Enter
+            break
+
+    cv2.destroyWindow(window_name)
+
+    # Build rectangle in original-image coordinates and shrink inward
+    orig_xs = [c[0] for c in corners]
+    orig_ys = [c[1] for c in corners]
+
+    rx0 = int(round(min(orig_xs))) + shrink
+    rx1 = int(round(max(orig_xs))) - shrink
+    ry0 = int(round(min(orig_ys))) + shrink
+    ry1 = int(round(max(orig_ys))) - shrink
+
+    rx0 = max(0, rx0)
+    ry0 = max(0, ry0)
+    rx1 = min(w - 1, rx1)
+    ry1 = min(h - 1, ry1)
+
+    if rx1 <= rx0 or ry1 <= ry0:
+        raise RuntimeError(
+            "ROI collapsed after shrinking. Please click the corners more carefully."
+        )
+
+    # Build rectangular mask
+    mask_roi = np.zeros((h, w), dtype=np.uint8)
+    mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] = 255
+
+    cx = (rx0 + rx1) // 2
+    cy = (ry0 + ry1) // 2
+    half_side = min(rx1 - rx0, ry1 - ry0) // 2   # used downstream like circle radius
+
+    print(f"  ROI rectangle: ({rx0}, {ry0}) – ({rx1}, {ry1}), "
+          f"center ({cx}, {cy}), half-side {half_side} px")
+
+    return mask_roi, (cx, cy, half_side)
+
+
+# =========================
+# ROI RECT HELPERS
+# =========================
+
+def roi_to_rect(mask_roi):
+    """
+    Extract the bounding rectangle from a binary ROI mask.
+    Returns (x0, y0, x1, y1) in image coordinates.
+    """
+    ys, xs = np.where(mask_roi == 255)
+    if len(ys) == 0:
+        raise RuntimeError("roi_to_rect: empty mask supplied")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def rect_to_roi(x0, y0, x1, y1, img_h, img_w):
+    """
+    Build (mask_roi, roi_params) from a bounding rectangle.
+    Clamps coordinates to image bounds.
+    Returns (uint8 mask, (cx, cy, half_side)).
+    """
+    x0c = max(0, min(img_w - 1, x0))
+    y0c = max(0, min(img_h - 1, y0))
+    x1c = max(0, min(img_w - 1, x1))
+    y1c = max(0, min(img_h - 1, y1))
+    mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    mask[y0c:y1c + 1, x0c:x1c + 1] = 255
+    cx = (x0c + x1c) // 2
+    cy = (y0c + y1c) // 2
+    half_side = min(x1c - x0c, y1c - y0c) // 2
+    return mask, (cx, cy, half_side)
+
+
+# =========================
+# PER-IMAGE ROI NUDGE
+# =========================
+
+def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
+    """
+    Show a rotated sample image with the ROI rectangle overlaid and let the
+    user nudge its position to compensate for slight frame-to-frame shifts.
+
+    Coarse nudge (arrow keys)  : ±10 px in the respective direction
+    Fine nudge:
+        z / x          : left / right  ±1 px
+        , / .          : up   / down   ±1 px
+    r                  : reset to the position passed in (baseline position)
+    a                  : accept this position for ALL remaining images
+                         (no more nudge windows will appear)
+    Enter / Space      : confirm for this image and advance
+
+    Returns: (x0, y0, x1, y1, apply_to_all)
+        x0/y0/x1/y1  – final rectangle in original-image coordinates
+        apply_to_all – True if the user pressed 'a'
+    """
+    WIN = ("Confirm ROI  |  arrows=10px  z/x=H±1  ,/.=V±1  "
+           "r=reset  a=accept-all  Enter=confirm")
+    h_img, w_img = image_bgr.shape[:2]
+    MAX_W, MAX_H = 1400, 900
+    scale = min(MAX_W / w_img, MAX_H / h_img, 1.0)
+    disp_w = max(1, int(w_img * scale))
+    disp_h = max(1, int(h_img * scale))
+    disp_base = cv2.resize(image_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+    orig_x0, orig_y0, orig_x1, orig_y1 = x0, y0, x1, y1
+    cur_x0, cur_y0, cur_x1, cur_y1 = x0, y0, x1, y1
+    bname = os.path.basename(image_name) if image_name else "image"
+
+    def _clamp(cx0, cy0, cx1, cy1):
+        rw = cx1 - cx0
+        rh = cy1 - cy0
+        cx0 = max(0, min(w_img - rw, cx0))
+        cy0 = max(0, min(h_img - rh, cy0))
+        return cx0, cy0, cx0 + rw, cy0 + rh
+
+    def _render(cx0, cy0, cx1, cy1):
+        disp = disp_base.copy()
+        rx0d = int(cx0 * scale); ry0d = int(cy0 * scale)
+        rx1d = int(cx1 * scale); ry1d = int(cy1 * scale)
+        cv2.rectangle(disp, (rx0d, ry0d), (rx1d, ry1d), (255, 0, 0), 2)
+        dx = cx0 - orig_x0
+        dy = cy0 - orig_y0
+        lines = [
+            f"{bname}  |  offset from baseline: ({dx:+d}, {dy:+d}) px",
+            "arrows=10px  z/x=H-fine  ,/.=V-fine  r=reset  a=accept-all  Enter=confirm",
+        ]
+        for i, txt in enumerate(lines):
+            yy = 28 + i * 26
+            cv2.putText(disp, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+            cv2.putText(disp, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        return disp
+
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, disp_w, disp_h)
+    cv2.imshow(WIN, _render(cur_x0, cur_y0, cur_x1, cur_y1))
+
+    apply_to_all = False
+    while True:
+        key = cv2.waitKey(0)
+        k = key & 0xFFFF
+
+        moved = True
+        if k in (13, 10):                    # Enter -- confirm this image
+            moved = False
+            break
+        elif k in (32,):                     # Space -- also confirm
+            moved = False
+            break
+        elif k == ord('a'):                  # accept-all remaining images
+            apply_to_all = True
+            moved = False
+            break
+        elif k == ord('r'):                  # reset to original position
+            cur_x0, cur_y0, cur_x1, cur_y1 = orig_x0, orig_y0, orig_x1, orig_y1
+        elif k in (81, 63234):               # Left arrow  → 10 px left
+            cur_x0 -= 10; cur_x1 -= 10
+        elif k in (83, 63235):               # Right arrow → 10 px right
+            cur_x0 += 10; cur_x1 += 10
+        elif k in (82, 63232):               # Up arrow    → 10 px up
+            cur_y0 -= 10; cur_y1 -= 10
+        elif k in (84, 63233):               # Down arrow  → 10 px down
+            cur_y0 += 10; cur_y1 += 10
+        elif k == ord('z'):                  # fine left 1 px
+            cur_x0 -= 1; cur_x1 -= 1
+        elif k == ord('x'):                  # fine right 1 px
+            cur_x0 += 1; cur_x1 += 1
+        elif k == ord(','):                  # fine up 1 px
+            cur_y0 -= 1; cur_y1 -= 1
+        elif k == ord('.'):                  # fine down 1 px
+            cur_y0 += 1; cur_y1 += 1
+        else:
+            moved = False
+
+        if moved:
+            cur_x0, cur_y0, cur_x1, cur_y1 = _clamp(cur_x0, cur_y0, cur_x1, cur_y1)
+        cv2.imshow(WIN, _render(cur_x0, cur_y0, cur_x1, cur_y1))
+
+    cv2.destroyWindow(WIN)
+    return cur_x0, cur_y0, cur_x1, cur_y1, apply_to_all
 
 
 # =========================
@@ -399,28 +1187,28 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
         font_scale = 3.0
     line_spacing = int(32 * font_scale)
 
-    # Precompute ROI circle from the mask so we can draw it every frame
+    # Precompute ROI rectangle from the mask so we can draw it every frame
     ys, xs = np.where(mask_roi == 255)
-    have_circle = False
-    cx = cy = r = 0.0
+    have_roi = False
+    rx0 = ry0 = rx1 = ry1 = 0
     if len(xs) > 0:
-        pts = np.column_stack((xs, ys)).astype(np.int32)
-        (cx_f, cy_f), r_f = cv2.minEnclosingCircle(pts)
-        cx, cy, r = float(cx_f), float(cy_f), float(r_f)
-        have_circle = True
+        rx0, rx1 = int(xs.min()), int(xs.max())
+        ry0, ry1 = int(ys.min()), int(ys.max())
+        have_roi = True
 
     # Define a crop centered on the ROI so the interactive window focuses on it.
-    # Target crop size in original pixels: 4x ROI width/height → side ≈ 8 * r.
-    if have_circle:
-        half_side = int(4.0 * r)  # half of the crop side length
-        if half_side < 50:
-            half_side = 50  # minimum crop size
-        crop_x0 = max(0, int(cx) - half_side)
-        crop_y0 = max(0, int(cy) - half_side)
-        crop_x1 = min(w, int(cx) + half_side)
-        crop_y1 = min(h, int(cy) + half_side)
+    if have_roi:
+        roi_w = rx1 - rx0
+        roi_h = ry1 - ry0
+        pad = max(roi_w, roi_h, 50)  # padding around the ROI
+        cx_roi = (rx0 + rx1) // 2
+        cy_roi = (ry0 + ry1) // 2
+        crop_x0 = max(0, cx_roi - pad)
+        crop_y0 = max(0, cy_roi - pad)
+        crop_x1 = min(w, cx_roi + pad)
+        crop_y1 = min(h, cy_roi + pad)
     else:
-        # Fallback: use full image if ROI circle is not available
+        # Fallback: use full image if ROI is not available
         crop_x0, crop_y0 = 0, 0
         crop_x1, crop_y1 = w, h
 
@@ -453,9 +1241,9 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
 
     # Instructions to overlay
     instructions = [
-        "1) LEFT-CLICK on 3–5 CLEAN, dust-free spots INSIDE the blue circle.",
-        "2) Use the circular magnifier to fine-tune each click position.",
-        "3) Press ENTER/SPACE when done (or 'q' to cancel and use full ROI).",
+        "Click 3-5 CLEAN, dust-free spots INSIDE the blue square.",
+        "Use the magnifier for precise placement.",
+        "Press ENTER when done (or 'q' to cancel and use full ROI).",
     ]
 
     # Store all clicked baseline points (original image coords)
@@ -497,12 +1285,13 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             )
             y_text += line_spacing
 
-        # Draw ROI circle (scaled to zoomed display, using crop offset)
-        if have_circle:
-            cx_d = int(round((cx - crop_x0) * zoom_factor))
-            cy_d = int(round((cy - crop_y0) * zoom_factor))
-            r_d = int(round(r * zoom_factor))
-            cv2.circle(disp_color, (cx_d, cy_d), r_d, (255, 0, 0), 2)
+        # Draw ROI rectangle (scaled to zoomed display, using crop offset)
+        if have_roi:
+            rx0_d = int(round((rx0 - crop_x0) * zoom_factor))
+            ry0_d = int(round((ry0 - crop_y0) * zoom_factor))
+            rx1_d = int(round((rx1 - crop_x0) * zoom_factor))
+            ry1_d = int(round((ry1 - crop_y0) * zoom_factor))
+            cv2.rectangle(disp_color, (rx0_d, ry0_d), (rx1_d, ry1_d), (255, 0, 0), 2)
 
         # Build an in-window circular magnification loupe near cursor
         if mouse_pos is not None:
@@ -518,7 +1307,7 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
                 loupe = cv2.resize(
                     roi,
                     (int(roi.shape[1] * LOUPE_ZOOM), int(roi.shape[0] * LOUPE_ZOOM)),
-                    interpolation=cv2.INTER_NEAREST,
+                    interpolation=cv2.INTER_LINEAR,
                 )
                 lh, lw = loupe.shape[:2]
 
@@ -698,10 +1487,13 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
 
 
 def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_override=None, debug=False,
-                         sample_name=None, spin_step=None, timestamp_str=None):
+                         sample_name=None, spin_step=None, timestamp_str=None,
+                         precomputed_mask_roi=None, precomputed_roi_params=None,
+                         rotation_angle=0.0):
     """
     Process a single image:
-      - detect circle ROI
+      - apply the batch rotation angle (set interactively on the baseline)
+      - auto-detect square ROI from the colored disc
       - measure dust
       - compute a continuous dust_intensity metric from dust_score
       - save dust-highlight overlay
@@ -712,23 +1504,30 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
     if image is None:
         raise RuntimeError(f"Could not read image: {img_path}")
 
+    # Apply the batch rotation (angle set interactively from the baseline image)
+    image = apply_rotation(image, rotation_angle)
+
     # Figure out base names / extensions
     base_name = os.path.basename(img_path)
     stem, ext = os.path.splitext(base_name)
     ext_lower = ext.lower()
 
-    # Decide what file the HTML report should use for the “Raw” preview
+    # Decide what file the HTML report should use for the "Raw" preview
     # For normal images → use the original file
     # For NEF → create a JPG preview: <stem>_raw.jpg
     raw_display_name = base_name
     if ext_lower == ".nef":
         raw_display_name = f"{stem}_raw.jpg"
         raw_display_path = os.path.join(out_dir, raw_display_name)
-        # Save the NEF-loaded image as a JPG preview for the report
+        # Save the (straightened) NEF-loaded image as a JPG preview for the report
         cv2.imwrite(raw_display_path, image)
 
-    # Detect ROI and measure dust
-    mask_roi, circle = find_ring_mask_auto(image)
+    # Use precomputed ROI if supplied, otherwise auto-detect per image
+    if precomputed_mask_roi is not None and precomputed_roi_params is not None:
+        mask_roi = precomputed_mask_roi
+        circle = precomputed_roi_params
+    else:
+        mask_roi, circle = find_roi_from_grid(image)
     dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score = measure_dust(
         image,
         mask_roi,
@@ -769,8 +1568,13 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
 
     overlay = (base_f * (1.0 - alpha) + red_img * alpha).astype(np.uint8)
 
-    # Draw ROI circle on top
-    cv2.circle(overlay, (circle[0], circle[1]), circle[2], (255, 0, 0), 2)
+    # Draw ROI boundary on overlay (rectangle for user-guided square ROI)
+    ys_roi, xs_roi = np.where(mask_roi == 255)
+    if len(xs_roi) > 0:
+        cv2.rectangle(overlay,
+                      (int(xs_roi.min()), int(ys_roi.min())),
+                      (int(xs_roi.max()), int(ys_roi.max())),
+                      (255, 0, 0), 2)
 
     # Crop around ROI and add footer with metadata
     cropped_with_footer = create_cropped_highlight_with_footer(
@@ -784,7 +1588,7 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
     )
 
     # Save highlight image
-    out_img = os.path.join(out_dir, f"{stem}_dust_highlight.jpg}")
+    out_img = os.path.join(out_dir, f"{stem}_dust_highlight.jpg")
     cv2.imwrite(out_img, cropped_with_footer)
 
     if debug:
@@ -990,7 +1794,32 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print(f"Baseline reference image: {baseline_fname}")
 
     baseline_image = load_image_any(baseline_path)
-    baseline_mask, _ = find_ring_mask_auto(baseline_image)
+
+    # Let the user rotate the baseline until grid lines are level.
+    # The confirmed angle is applied to every image in the batch.
+    print("\nOpening baseline image for rotation adjustment...")
+    print("  Use a/d (or arrow keys) to rotate, z/x for fine adjustment,")
+    print("  r to reset, Enter to confirm, q to cancel (no rotation).")
+    rotation_angle = interactive_rotation(baseline_image)
+    print(f"  Rotation angle confirmed: {rotation_angle:+.1f} deg")
+    baseline_image = apply_rotation(baseline_image, rotation_angle)
+
+    # Let the user draw the ROI rectangle on the baseline image.
+    # The card is fixed for the entire batch, so every sample image reuses
+    # this same ROI -- no per-image detection needed.
+    print("\nROI selection: click the 4 corners of the Sharpie grid square in the")
+    print("  baseline image.  Press 'r' to restart, Enter to confirm.")
+    baseline_mask, roi_params = find_roi_user_guided(baseline_image)
+    print(f"  ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
+    print("  ROI confirmed. A nudge window will appear for each image so you")
+    print("  can fine-tune the position.  Press 'a' to lock the current position")
+    print("  for all remaining images (skips further nudge prompts).")
+
+    # Extract the ROI as a rectangle for per-image nudge.
+    # base_roi_* holds the original baseline position for offset reporting.
+    cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1 = roi_to_rect(baseline_mask)
+    base_roi_x0, base_roi_y0 = cur_roi_x0, cur_roi_y0
+    apply_roi_to_all = False   # set True when user presses 'a' in nudge window
 
     # Let user interactively select a clean reference region on the untreated sample
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
@@ -1022,7 +1851,32 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # Process and create highlight in sample_dir
+
+        # Load + rotate for the ROI confirmation window.
+        # (process_single_image will reload the image independently for the
+        #  actual measurement; this load is only for the interactive preview.)
+        preview = apply_rotation(load_image_any(src_path), rotation_angle)
+        img_h, img_w = preview.shape[:2]
+
+        if not apply_roi_to_all:
+            # Show the image with the current ROI box; let user nudge if needed.
+            nx0, ny0, nx1, ny1, apply_roi_to_all = interactive_roi_nudge(
+                preview,
+                cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1,
+                image_name=fname,
+            )
+            cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1 = nx0, ny0, nx1, ny1
+            if apply_roi_to_all:
+                print(f"  ROI locked at offset "
+                      f"({cur_roi_x0 - base_roi_x0:+d}, "
+                      f"{cur_roi_y0 - base_roi_y0:+d}) px "
+                      f"for all remaining images.")
+
+        # Build the per-image mask from the (possibly adjusted) rectangle.
+        sample_mask, sample_roi_params = rect_to_roi(
+            cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1, img_h, img_w
+        )
+
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1032,6 +1886,9 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             sample_name=sample_name,
             spin_step=spin_step,
             timestamp_str=run_timestamp,
+            rotation_angle=rotation_angle,
+            precomputed_mask_roi=sample_mask,
+            precomputed_roi_params=sample_roi_params,
         )
         results.append(res)
 
