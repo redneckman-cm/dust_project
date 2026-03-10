@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.2"  # disc circularity filter + disc-anchored card detection
+TOOL_VERSION = "0.5.3"  # user-guided batch rotation replaces auto card-straightening
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -448,6 +448,110 @@ def straighten_and_crop_to_card(image_bgr, padding_px=40):
         rotated = rotated[y1:y2, x1:x2]
 
     return rotated, correction
+
+
+# =========================
+# ROTATION HELPERS
+# =========================
+
+def apply_rotation(image_bgr, angle_deg):
+    """
+    Rotate image_bgr by angle_deg (positive = CCW in OpenCV convention).
+    Canvas is expanded so no pixel content is clipped.
+    Returns the rotated image unchanged if angle is essentially zero.
+    """
+    if abs(angle_deg) < 0.001:
+        return image_bgr
+    h, w = image_bgr.shape[:2]
+    cos_a = abs(np.cos(np.radians(angle_deg)))
+    sin_a = abs(np.sin(np.radians(angle_deg)))
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+    M[0, 2] += (new_w - w) / 2.0
+    M[1, 2] += (new_h - h) / 2.0
+    return cv2.warpAffine(image_bgr, M, (new_w, new_h),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=(128, 128, 128))
+
+
+def interactive_rotation(image_bgr):
+    """
+    Show the image in an interactive window and let the user rotate it with
+    keyboard keys until the grid lines are perfectly horizontal/vertical.
+    The confirmed angle is then applied to every image in the batch.
+
+    Keys:
+        a  /  Left  arrow  --  rotate CCW  1.0 deg
+        d  /  Right arrow  --  rotate  CW  1.0 deg
+        z  /  ,            --  rotate CCW  0.1 deg  (fine)
+        x  /  .            --  rotate  CW  0.1 deg  (fine)
+        r                  --  reset to 0 deg
+        Enter              --  confirm and use this angle
+        q                  --  cancel (use 0 deg, no rotation)
+
+    Returns: angle_deg (float, positive = CCW correction applied to every image)
+    """
+    WIN = "Straighten -- a/d to rotate  z/x for fine  r=reset  Enter=confirm  q=cancel"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+
+    h, w = image_bgr.shape[:2]
+    MAX_W, MAX_H = 1400, 900
+    scale = min(MAX_W / w, MAX_H / h, 1.0)
+    disp_w = max(1, int(w * scale))
+    disp_h = max(1, int(h * scale))
+
+    angle = 0.0
+
+    def _render(ang):
+        # Rotate in-place (display only -- no canvas expansion needed here)
+        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), ang, 1.0)
+        rot = cv2.warpAffine(image_bgr, M, (w, h),
+                             flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT,
+                             borderValue=(128, 128, 128))
+        disp = cv2.resize(rot, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+        lines = [
+            f"Angle: {ang:+.1f} deg",
+            "a/Left: CCW 1deg   d/Right: CW 1deg",
+            "z/,: CCW 0.1deg    x/.: CW 0.1deg",
+            "r: reset   Enter: confirm   q: cancel (no rotation)",
+        ]
+        for i, txt in enumerate(lines):
+            y = 28 + i * 26
+            cv2.putText(disp, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+            cv2.putText(disp, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        return disp
+
+    cv2.imshow(WIN, _render(angle))
+    cv2.resizeWindow(WIN, disp_w, disp_h)
+
+    while True:
+        key = cv2.waitKey(0)
+        k = key & 0xFFFF  # keep 16 bits for macOS extended arrow key codes
+
+        if k in (13, 10):       # Enter / Return -- confirm
+            break
+        elif k == ord('q'):     # cancel -- no rotation
+            angle = 0.0
+            break
+        elif k == ord('r'):     # reset
+            angle = 0.0
+        elif k in (ord('a'), 81, 63234):   # 'a' or Left arrow (81=Win, 63234=Mac)
+            angle += 1.0    # CCW
+        elif k in (ord('d'), 83, 63235):   # 'd' or Right arrow (83=Win, 63235=Mac)
+            angle -= 1.0    # CW
+        elif k in (ord('z'), ord(',')):    # fine CCW
+            angle += 0.1
+        elif k in (ord('x'), ord('.')):    # fine CW
+            angle -= 0.1
+
+        cv2.imshow(WIN, _render(angle))
+
+    cv2.destroyWindow(WIN)
+    return round(angle, 1)
 
 
 # =========================
@@ -1126,10 +1230,11 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
 
 def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_override=None, debug=False,
                          sample_name=None, spin_step=None, timestamp_str=None,
-                         precomputed_mask_roi=None, precomputed_roi_params=None):
+                         precomputed_mask_roi=None, precomputed_roi_params=None,
+                         rotation_angle=0.0):
     """
     Process a single image:
-      - straighten and crop to the white target card (per-image, any tilt angle)
+      - apply the batch rotation angle (set interactively on the baseline)
       - auto-detect square ROI from the colored disc
       - measure dust
       - compute a continuous dust_intensity metric from dust_score
@@ -1141,8 +1246,8 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
     if image is None:
         raise RuntimeError(f"Could not read image: {img_path}")
 
-    # Straighten and crop to the target card -- works at any tilt angle
-    image, _angle = straighten_and_crop_to_card(image)
+    # Apply the batch rotation (angle set interactively from the baseline image)
+    image = apply_rotation(image, rotation_angle)
 
     # Figure out base names / extensions
     base_name = os.path.basename(img_path)
@@ -1432,9 +1537,14 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
 
     baseline_image = load_image_any(baseline_path)
 
-    # Straighten and crop the baseline image the same way each processed image will be.
-    print("\nAuto-straightening baseline image...")
-    baseline_image, _angle = straighten_and_crop_to_card(baseline_image)
+    # Let the user rotate the baseline until grid lines are level.
+    # The confirmed angle is applied to every image in the batch.
+    print("\nOpening baseline image for rotation adjustment...")
+    print("  Use a/d (or arrow keys) to rotate, z/x for fine adjustment,")
+    print("  r to reset, Enter to confirm, q to cancel (no rotation).")
+    rotation_angle = interactive_rotation(baseline_image)
+    print(f"  Rotation angle confirmed: {rotation_angle:+.1f} deg")
+    baseline_image = apply_rotation(baseline_image, rotation_angle)
 
     # Auto-detect the ROI square from the baseline disc (square inscribed in disc).
     # Each processed image re-detects its own ROI to track disc movement between shots.
@@ -1472,7 +1582,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # Each image is individually straightened, cropped, and ROI-detected.
+        # Apply the same rotation the user set on the baseline; ROI auto-detected per image.
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1482,6 +1592,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             sample_name=sample_name,
             spin_step=spin_step,
             timestamp_str=run_timestamp,
+            rotation_angle=rotation_angle,
         )
         results.append(res)
 
