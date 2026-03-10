@@ -587,28 +587,28 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
         font_scale = 3.0
     line_spacing = int(32 * font_scale)
 
-    # Precompute ROI circle from the mask so we can draw it every frame
+    # Precompute ROI rectangle from the mask so we can draw it every frame
     ys, xs = np.where(mask_roi == 255)
-    have_circle = False
-    cx = cy = r = 0.0
+    have_roi = False
+    rx0 = ry0 = rx1 = ry1 = 0
     if len(xs) > 0:
-        pts = np.column_stack((xs, ys)).astype(np.int32)
-        (cx_f, cy_f), r_f = cv2.minEnclosingCircle(pts)
-        cx, cy, r = float(cx_f), float(cy_f), float(r_f)
-        have_circle = True
+        rx0, rx1 = int(xs.min()), int(xs.max())
+        ry0, ry1 = int(ys.min()), int(ys.max())
+        have_roi = True
 
     # Define a crop centered on the ROI so the interactive window focuses on it.
-    # Target crop size in original pixels: 4x ROI width/height → side ≈ 8 * r.
-    if have_circle:
-        half_side = int(4.0 * r)  # half of the crop side length
-        if half_side < 50:
-            half_side = 50  # minimum crop size
-        crop_x0 = max(0, int(cx) - half_side)
-        crop_y0 = max(0, int(cy) - half_side)
-        crop_x1 = min(w, int(cx) + half_side)
-        crop_y1 = min(h, int(cy) + half_side)
+    if have_roi:
+        roi_w = rx1 - rx0
+        roi_h = ry1 - ry0
+        pad = max(roi_w, roi_h, 50)  # padding around the ROI
+        cx_roi = (rx0 + rx1) // 2
+        cy_roi = (ry0 + ry1) // 2
+        crop_x0 = max(0, cx_roi - pad)
+        crop_y0 = max(0, cy_roi - pad)
+        crop_x1 = min(w, cx_roi + pad)
+        crop_y1 = min(h, cy_roi + pad)
     else:
-        # Fallback: use full image if ROI circle is not available
+        # Fallback: use full image if ROI is not available
         crop_x0, crop_y0 = 0, 0
         crop_x1, crop_y1 = w, h
 
@@ -641,7 +641,7 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
 
     # Instructions to overlay
     instructions = [
-        "1) LEFT-CLICK on 3–5 CLEAN, dust-free spots INSIDE the blue circle.",
+        "1) LEFT-CLICK on 3–5 CLEAN, dust-free spots INSIDE the blue square.",
         "2) Use the circular magnifier to fine-tune each click position.",
         "3) Press ENTER/SPACE when done (or 'q' to cancel and use full ROI).",
     ]
@@ -685,12 +685,13 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             )
             y_text += line_spacing
 
-        # Draw ROI circle (scaled to zoomed display, using crop offset)
-        if have_circle:
-            cx_d = int(round((cx - crop_x0) * zoom_factor))
-            cy_d = int(round((cy - crop_y0) * zoom_factor))
-            r_d = int(round(r * zoom_factor))
-            cv2.circle(disp_color, (cx_d, cy_d), r_d, (255, 0, 0), 2)
+        # Draw ROI rectangle (scaled to zoomed display, using crop offset)
+        if have_roi:
+            rx0_d = int(round((rx0 - crop_x0) * zoom_factor))
+            ry0_d = int(round((ry0 - crop_y0) * zoom_factor))
+            rx1_d = int(round((rx1 - crop_x0) * zoom_factor))
+            ry1_d = int(round((ry1 - crop_y0) * zoom_factor))
+            cv2.rectangle(disp_color, (rx0_d, ry0_d), (rx1_d, ry1_d), (255, 0, 0), 2)
 
         # Build an in-window circular magnification loupe near cursor
         if mouse_pos is not None:
