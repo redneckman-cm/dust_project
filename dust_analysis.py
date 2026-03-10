@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.6.1"  # Sensitivity tuning: percentile 95, min-ceiling threshold, no morph cleanup
+TOOL_VERSION = "0.6.2"  # Sweet-spot constants: SIGMA_K=0.25, MIN_ABS_DELTA=0.4, percentile=98.5
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -47,8 +47,8 @@ DUST_PERCENTILE = 92.0      # higher -> fewer pixels marked as dust
 # relative to the baseline patches you selected.
 # Slightly more aggressive values (K and absolute delta) to better catch
 # mid-tone "shadowy" dust regions while still rejecting most noise.
-BASELINE_SIGMA_K = 0.3         # smaller K => more sensitive to darker-than-baseline pixels
-BASELINE_MIN_ABS_DELTA = 0.7   # allow moderately darker specks/shadows to count as dust
+BASELINE_SIGMA_K = 0.25        # smaller K => more sensitive to darker-than-baseline pixels
+BASELINE_MIN_ABS_DELTA = 0.4   # allow moderately darker specks/shadows to count as dust
 BASELINE_LOCAL_PERCENTILE = 85.0  # slightly lower so more local-contrast specks qualify
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".nef")
@@ -1162,7 +1162,7 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 # BASELINE DARK THRESHOLD CALIBRATION
 # =========================
 
-def compute_baseline_dark_threshold(baseline_image_bgr, baseline_mask, baseline_stats, percentile=95.0):
+def compute_baseline_dark_threshold(baseline_image_bgr, baseline_mask, baseline_stats, percentile=98.5):
     """Derive a fixed darkness threshold from the untreated baseline image.
 
     Uses the same simple delta = base_mean - gray as measure_dust (no shading
