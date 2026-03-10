@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.3"  # user-guided batch rotation replaces auto card-straightening
+TOOL_VERSION = "0.5.4"  # ROI detected from printed black grid lines, not disc colour
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -296,38 +296,104 @@ def _find_disc_center(image_bgr):
 
 
 # =========================
-# AUTO-DETECT SQUARE ROI
+# AUTO-DETECT SQUARE ROI FROM GRID
 # =========================
 
-def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
     """
-    Auto-detect the ROI square per image by finding the colored disc (orange /
-    yellow / green / pink) and inscribing a square inside it.
+    Detect the ROI square from the printed black grid lines on the target card.
 
-    Delegates colour + circularity detection to _find_disc_center() so that
-    orange tape strips are not confused with the actual disc.
+    The target card has a grid of black lines (e.g. 3x3 cells).  All grid
+    lines connect at intersections and form ONE connected dark region.  The
+    bounding rectangle of that region defines the outer boundary of the grid,
+    which is the ROI.
 
-    Called once per image, so the ROI correctly tracks the disc even when the
-    physical sample moves between shots.
+    Steps:
+      1. Grayscale + threshold to isolate near-black pixels.
+      2. Morphological clean-up and slight dilation to join broken segments.
+      3. Find contours; pick the one whose bounding rect is:
+           - large enough (> 15 % of min image dimension on each side)
+           - roughly square (aspect ratio 0.55 - 1.8)
+           - low fill ratio  (lines, not a solid blob) fill < 0.60
+           - closest to the image centre (soft penalty)
+      4. Use the bounding rect of that contour, shrunk inward by `shrink` px.
 
     Returns: (mask_roi uint8 0/255, (cx, cy, half_side))
+    Raises:  RuntimeError if no grid-like region is found.
     """
     h, w = image_bgr.shape[:2]
+    min_dim = min(h, w)
+    img_cx, img_cy = w / 2.0, h / 2.0
 
-    cx, cy, r = _find_disc_center(image_bgr)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Inscribed square: half_side = r / sqrt(2), then shrink inward
-    half_side = max(5, int(r / np.sqrt(2)) - shrink)
+    # Threshold: capture near-black pixels (printed grid lines should be < ~70)
+    _, dark = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
 
-    rx0 = max(0, int(cx) - half_side)
-    rx1 = min(w - 1, int(cx) + half_side)
-    ry0 = max(0, int(cy) - half_side)
-    ry1 = min(h - 1, int(cy) + half_side)
+    # Remove isolated noise, then lightly dilate to join broken line segments
+    kern_open   = np.ones((3, 3), np.uint8)
+    kern_dilate = np.ones((5, 5), np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kern_open, iterations=1)
+    dark = cv2.dilate(dark, kern_dilate, iterations=1)
+
+    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise RuntimeError("find_roi_from_grid: no dark regions found in image.")
+
+    best = None
+    best_score = -1e9
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        x, y, bw, bh = cv2.boundingRect(c)
+
+        # Must span a meaningful fraction of the image on both axes
+        if bw < min_dim * 0.15 or bh < min_dim * 0.15:
+            continue
+
+        # Must be roughly square (the grid outer boundary is square)
+        aspect = min(bw, bh) / float(max(bw, bh))
+        if aspect < 0.55:
+            continue
+
+        # Fill ratio: grid lines leave most of the interior empty (white),
+        # so the contour area / bounding-box area should be LOW.
+        fill = area / float(bw * bh)
+        if fill > 0.60:
+            continue  # too solid -- probably noise or a filled blob
+
+        # Prefer contours centred in the image
+        cx_c = x + bw / 2.0
+        cy_c = y + bh / 2.0
+        dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
+
+        # Score: favour large (tight to grid size) and central
+        score = min(bw, bh) - dc * min_dim * 3.0
+
+        if score > best_score:
+            best_score = score
+            best = (x, y, bw, bh)
+
+    if best is None:
+        raise RuntimeError(
+            "find_roi_from_grid: could not identify the printed grid square. "
+            "Make sure the black grid lines are visible and the image is in focus."
+        )
+
+    x, y, bw, bh = best
+    cx_roi = int(x + bw / 2)
+    cy_roi = int(y + bh / 2)
+    half_side = max(5, min(bw, bh) // 2 - shrink)
+
+    rx0 = max(0, cx_roi - half_side)
+    rx1 = min(w - 1, cx_roi + half_side)
+    ry0 = max(0, cy_roi - half_side)
+    ry1 = min(h - 1, cy_roi + half_side)
 
     mask_roi = np.zeros((h, w), dtype=np.uint8)
     mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] = 255
 
-    return mask_roi, (int(cx), int(cy), half_side)
+    return mask_roi, (cx_roi, cy_roi, half_side)
 
 
 def straighten_and_crop_to_card(image_bgr, padding_px=40):
@@ -1287,7 +1353,7 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
         mask_roi = precomputed_mask_roi
         circle = precomputed_roi_params
     else:
-        mask_roi, circle = find_roi_auto(image)
+        mask_roi, circle = find_roi_from_grid(image)
     dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score = measure_dust(
         image,
         mask_roi,
@@ -1566,8 +1632,8 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
 
     # Auto-detect the ROI square from the baseline disc (square inscribed in disc).
     # Each processed image re-detects its own ROI to track disc movement between shots.
-    print("\nAuto-detecting ROI from colored disc in baseline image...")
-    baseline_mask, roi_params = find_roi_auto(baseline_image)
+    print("\nAuto-detecting ROI from printed grid lines in baseline image...")
+    baseline_mask, roi_params = find_roi_from_grid(baseline_image)
     print(f"ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
 
     # Let user interactively select a clean reference region on the untreated sample
