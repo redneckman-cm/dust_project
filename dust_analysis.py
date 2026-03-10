@@ -982,7 +982,7 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
     )
 
     # Save highlight image
-    out_img = os.path.join(out_dir, f"{stem}_dust_highlight.jpg}")
+    out_img = os.path.join(out_dir, f"{stem}_dust_highlight.jpg")
     cv2.imwrite(out_img, cropped_with_footer)
 
     if debug:
