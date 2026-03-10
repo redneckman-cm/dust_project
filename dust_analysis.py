@@ -504,8 +504,22 @@ def interactive_rotation(image_bgr):
 
     angle = 0.0
 
+    # Pre-build the static alignment grid (never rotates -- fixed to the screen).
+    # Fine lines every ~step px; brighter centre crosshair for reference.
+    step = max(40, disp_h // 10)   # ~10 rows across the window height
+    grid_layer = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+    GRID_COLOR  = (0, 180, 180)   # dim cyan for minor grid lines
+    CROSS_COLOR = (0, 255, 255)   # bright cyan for centre crosshair
+    for gx in range(0, disp_w, step):
+        cv2.line(grid_layer, (gx, 0), (gx, disp_h - 1), GRID_COLOR, 1)
+    for gy in range(0, disp_h, step):
+        cv2.line(grid_layer, (0, gy), (disp_w - 1, gy), GRID_COLOR, 1)
+    # Centre crosshair (thicker + brighter)
+    cv2.line(grid_layer, (disp_w // 2, 0), (disp_w // 2, disp_h - 1), CROSS_COLOR, 2)
+    cv2.line(grid_layer, (0, disp_h // 2), (disp_w - 1, disp_h // 2), CROSS_COLOR, 2)
+
     def _render(ang):
-        # Rotate in-place (display only -- no canvas expansion needed here)
+        # Rotate the image content (the grid stays fixed on top)
         M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), ang, 1.0)
         rot = cv2.warpAffine(image_bgr, M, (w, h),
                              flags=cv2.INTER_LINEAR,
@@ -513,8 +527,12 @@ def interactive_rotation(image_bgr):
                              borderValue=(128, 128, 128))
         disp = cv2.resize(rot, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
 
+        # Blend static grid over the rotated image (40% opacity)
+        disp = cv2.addWeighted(disp, 1.0, grid_layer, 0.4, 0)
+
+        # Text overlay
         lines = [
-            f"Angle: {ang:+.1f} deg",
+            f"Angle: {ang:+.1f} deg  |  Align card lines to the cyan grid",
             "a/Left: CCW 1deg   d/Right: CW 1deg",
             "z/,: CCW 0.1deg    x/.: CW 0.1deg",
             "r: reset   Enter: confirm   q: cancel (no rotation)",
