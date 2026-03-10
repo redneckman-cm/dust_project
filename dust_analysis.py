@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.4.0"  # user-guided square ROI selection
+TOOL_VERSION = "0.5.1"  # auto-detect ROI + straighten/crop to card
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -264,11 +264,12 @@ def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
             (cx_c, cy_c), r_c = cv2.minEnclosingCircle(c)
             cx_c, cy_c, r_c = float(cx_c), float(cy_c), float(r_c)
             dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
-            if dc > 0.45:          # disc can be off-centre; be more lenient than old ring finder
+            # After straighten_and_crop_to_card, the disc can be anywhere in
+            # the cropped frame -- remove the hard center-distance cutoff and
+            # only use it as a soft penalty in the score.
+            if not (min_dim * 0.04 < r_c < min_dim * 0.55):
                 continue
-            if not (min_dim * 0.06 < r_c < min_dim * 0.40):
-                continue
-            score = area - (dc * 5000.0)
+            score = area - (dc * 3000.0)
             if score > best_score:
                 best_score = score
                 best_ring = (cx_c, cy_c, r_c)
