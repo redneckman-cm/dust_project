@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.1"  # auto-detect ROI + straighten/crop to card
+TOOL_VERSION = "0.5.2"  # disc circularity filter + disc-anchored card detection
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -222,18 +222,19 @@ def find_ring_mask_auto(image_bgr, inner_fraction: float = 0.44, inner_shrink: i
 
 
 # =========================
-# AUTO-DETECT SQUARE ROI
+# DISC DETECTION HELPER
 # =========================
 
-def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+def _find_disc_center(image_bgr):
     """
-    Auto-detect the ROI square per image by finding the colored disc (orange /
-    yellow / green / pink) and inscribing a square inside it.
+    Locate the coloured filter disc (orange / yellow / green / pink) in image_bgr.
 
-    Called once per image, so the ROI correctly tracks the disc even when the
-    physical sample moves between shots.
+    Uses HSV colour segmentation across multiple colour ranges, then applies a
+    circularity filter  (circularity = 4*pi*area / perimeter^2 > 0.45)  to
+    reject elongated tape strips that share the disc's hue but are not circular.
 
-    Returns: (mask_roi uint8 0/255, (cx, cy, half_side))
+    Returns: (cx, cy, r)  -- centre x, centre y, and radius in pixels (floats)
+    Raises:  RuntimeError if no sufficiently circular blob is found.
     """
     h, w = image_bgr.shape[:2]
     min_dim = min(h, w)
@@ -241,14 +242,14 @@ def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
 
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     color_ranges = [
-        (np.array([15, 80, 80],  dtype=np.uint8), np.array([40, 255, 255], dtype=np.uint8)),  # yellow
+        (np.array([15, 80, 80],  dtype=np.uint8), np.array([40, 255, 255], dtype=np.uint8)),  # yellow/orange
         (np.array([5,  80, 80],  dtype=np.uint8), np.array([20, 255, 255], dtype=np.uint8)),  # orange
         (np.array([40, 40, 40],  dtype=np.uint8), np.array([80, 255, 255], dtype=np.uint8)),  # green
-        (np.array([160, 60, 60], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8)), # pink
-        (np.array([0,  60, 60],  dtype=np.uint8), np.array([10, 255, 255], dtype=np.uint8)),  # pink wrap
+        (np.array([160, 60, 60], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8)), # pink/red
+        (np.array([0,  60, 60],  dtype=np.uint8), np.array([10, 255, 255], dtype=np.uint8)),  # pink/red wrap
     ]
 
-    best_ring = None
+    best = None
     best_score = -1e9
     kernel = np.ones((5, 5), np.uint8)
 
@@ -257,30 +258,64 @@ def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         for c in contours:
             area = cv2.contourArea(c)
             if area < (min_dim * min_dim * 0.002):
                 continue
+
+            # --- circularity filter: rejects tape strips and other elongated blobs ---
+            perimeter = cv2.arcLength(c, True)
+            if perimeter < 1:
+                continue
+            circularity = 4.0 * np.pi * area / (perimeter ** 2)
+            if circularity < 0.45:
+                continue  # not round enough -- skip
+
             (cx_c, cy_c), r_c = cv2.minEnclosingCircle(c)
             cx_c, cy_c, r_c = float(cx_c), float(cy_c), float(r_c)
-            dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
-            # After straighten_and_crop_to_card, the disc can be anywhere in
-            # the cropped frame -- remove the hard center-distance cutoff and
-            # only use it as a soft penalty in the score.
+
             if not (min_dim * 0.04 < r_c < min_dim * 0.55):
                 continue
+
+            # Soft penalty for being far from image centre
+            dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
             score = area - (dc * 3000.0)
+
             if score > best_score:
                 best_score = score
-                best_ring = (cx_c, cy_c, r_c)
+                best = (cx_c, cy_c, r_c)
 
-    if best_ring is None:
+    if best is None:
         raise RuntimeError(
-            "find_roi_auto: could not detect the colored disc. "
-            "Check that the sample is visible and the color matches a known range."
+            "_find_disc_center: could not detect a circular coloured disc. "
+            "Check that the sample is visible and not obscured by tape or other objects."
         )
 
-    cx, cy, r = best_ring
+    return best  # (cx, cy, r)
+
+
+# =========================
+# AUTO-DETECT SQUARE ROI
+# =========================
+
+def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+    """
+    Auto-detect the ROI square per image by finding the colored disc (orange /
+    yellow / green / pink) and inscribing a square inside it.
+
+    Delegates colour + circularity detection to _find_disc_center() so that
+    orange tape strips are not confused with the actual disc.
+
+    Called once per image, so the ROI correctly tracks the disc even when the
+    physical sample moves between shots.
+
+    Returns: (mask_roi uint8 0/255, (cx, cy, half_side))
+    """
+    h, w = image_bgr.shape[:2]
+
+    cx, cy, r = _find_disc_center(image_bgr)
+
     # Inscribed square: half_side = r / sqrt(2), then shrink inward
     half_side = max(5, int(r / np.sqrt(2)) - shrink)
 
@@ -297,21 +332,37 @@ def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
 
 def straighten_and_crop_to_card(image_bgr, padding_px=40):
     """
-    Detect the white target card using HSV segmentation, rotate the image to
-    make the card axis-aligned (grid lines horizontal/vertical) at ANY tilt
-    angle, then crop tightly to the card area.
+    Detect the white target card, rotate the image so grid lines are
+    horizontal/vertical at ANY tilt angle, then crop tightly to the card.
 
-    Uses minAreaRect on the white card contour, so it works regardless of how
-    much the camera is tilted -- unlike Hough-line approaches that fail beyond
-    ~15 degrees.
+    Key improvement over the previous version: card selection is ANCHORED to
+    the disc location.  After finding the disc with _find_disc_center(), we
+    pick the white contour that CONTAINS the disc centre (pointPolygonTest)
+    rather than blindly choosing the largest white blob.  This prevents shiny
+    metallic surfaces from being mistaken for the paper target card.
+
+    Steps:
+      1. Find disc centre with _find_disc_center().
+      2. HSV-segment white/light-grey areas.
+      3. Select the white contour that contains the disc centre.
+         Fall back to largest contour if none contains the disc.
+      4. Rotate by minAreaRect angle -- works at any tilt.
+      5. Crop to card bounding box in the rotated image (disc-anchored again).
 
     Returns: (processed_image, correction_angle_deg)
     Falls back to (original_image, 0.0) if the card cannot be detected.
     """
     h, w = image_bgr.shape[:2]
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
-    # White/light-grey paper: low saturation, high brightness
+    # --- Step 1: locate disc ---
+    try:
+        disc_cx, disc_cy, _disc_r = _find_disc_center(image_bgr)
+    except RuntimeError as exc:
+        print(f"[straighten] {exc} -- skipping rotation/crop.")
+        return image_bgr, 0.0
+
+    # --- Step 2: find white/light-grey regions ---
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     white_mask = cv2.inRange(hsv,
                              np.array([0,   0, 150], dtype=np.uint8),
                              np.array([180, 80, 255], dtype=np.uint8))
@@ -324,25 +375,32 @@ def straighten_and_crop_to_card(image_bgr, padding_px=40):
         print("[straighten] Could not detect white target card -- skipping rotation/crop.")
         return image_bgr, 0.0
 
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < h * w * 0.04:
-        print("[straighten] White area too small -- skipping rotation/crop.")
-        return image_bgr, 0.0
+    # --- Step 3: pick white contour that contains the disc centre ---
+    disc_pt = (float(disc_cx), float(disc_cy))
+    card_contour = None
+    large_contours = [c for c in contours if cv2.contourArea(c) >= h * w * 0.04]
 
-    rect = cv2.minAreaRect(largest)
+    for c in large_contours:
+        if cv2.pointPolygonTest(c, disc_pt, False) >= 0:
+            card_contour = c
+            break
+
+    if card_contour is None:
+        if not large_contours:
+            print("[straighten] No large white region found -- skipping rotation/crop.")
+            return image_bgr, 0.0
+        card_contour = max(large_contours, key=cv2.contourArea)
+        print("[straighten] Disc centre not inside any white region; using largest white blob.")
+
+    # --- Step 4: compute rotation angle and rotate ---
+    rect = cv2.minAreaRect(card_contour)
     rect_angle = rect[2]   # in [-90, 0)
 
-    # minAreaRect angle is in [-90, 0).  Pick the candidate rotation that is
-    # closest to 0 (i.e. the smallest correction needed):
-    #   cand1 = rect_angle       (in [-90,  0))
-    #   cand2 = rect_angle + 90  (in [  0, 90))
-    # The one with the smaller absolute value is the actual tilt angle.
-    # A positive value means rotate CCW (getRotationMatrix2D convention).
+    # Pick the candidate rotation closest to 0 (smallest absolute correction)
     cand1 = rect_angle
     cand2 = rect_angle + 90.0
     correction = cand1 if abs(cand1) <= abs(cand2) else cand2
 
-    # Rotate the full image.  Expand canvas so no corners are clipped.
     cos_a = abs(np.cos(np.radians(correction)))
     sin_a = abs(np.sin(np.radians(correction)))
     new_w = int(h * sin_a + w * cos_a)
@@ -356,7 +414,7 @@ def straighten_and_crop_to_card(image_bgr, padding_px=40):
                               borderMode=cv2.BORDER_CONSTANT,
                               borderValue=(128, 128, 128))
 
-    # Detect the card in the rotated image and crop to its bounding box
+    # --- Step 5: crop to card in rotated image (disc-anchored) ---
     rh, rw = rotated.shape[:2]
     hsv2 = cv2.cvtColor(rotated, cv2.COLOR_BGR2HSV)
     white_mask2 = cv2.inRange(hsv2,
@@ -365,15 +423,29 @@ def straighten_and_crop_to_card(image_bgr, padding_px=40):
     white_mask2 = cv2.morphologyEx(white_mask2, cv2.MORPH_CLOSE, kern)
     white_mask2 = cv2.morphologyEx(white_mask2, cv2.MORPH_OPEN, kern)
     c2, _ = cv2.findContours(white_mask2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Transform disc centre into rotated-image coordinates
+    disc_rot = M @ np.array([disc_cx, disc_cy, 1.0])
+    disc_rx, disc_ry = float(disc_rot[0]), float(disc_rot[1])
+    disc_pt2 = (disc_rx, disc_ry)
+
+    crop_contour = None
     if c2:
-        lg2 = max(c2, key=cv2.contourArea)
-        if cv2.contourArea(lg2) > rh * rw * 0.04:
-            x, y, bw, bh = cv2.boundingRect(lg2)
-            x1 = max(0, x - padding_px)
-            y1 = max(0, y - padding_px)
-            x2 = min(rw, x + bw + padding_px)
-            y2 = min(rh, y + bh + padding_px)
-            rotated = rotated[y1:y2, x1:x2]
+        large2 = [c for c in c2 if cv2.contourArea(c) >= rh * rw * 0.04]
+        for c in large2:
+            if cv2.pointPolygonTest(c, disc_pt2, False) >= 0:
+                crop_contour = c
+                break
+        if crop_contour is None and large2:
+            crop_contour = max(large2, key=cv2.contourArea)
+
+    if crop_contour is not None:
+        x, y, bw, bh = cv2.boundingRect(crop_contour)
+        x1 = max(0, x - padding_px)
+        y1 = max(0, y - padding_px)
+        x2 = min(rw, x + bw + padding_px)
+        y2 = min(rh, y + bh + padding_px)
+        rotated = rotated[y1:y2, x1:x2]
 
     return rotated, correction
 
