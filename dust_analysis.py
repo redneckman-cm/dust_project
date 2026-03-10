@@ -641,9 +641,9 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
 
     # Instructions to overlay
     instructions = [
-        "1) LEFT-CLICK on 3–5 CLEAN, dust-free spots INSIDE the blue square.",
-        "2) Use the circular magnifier to fine-tune each click position.",
-        "3) Press ENTER/SPACE when done (or 'q' to cancel and use full ROI).",
+        "Click 3-5 CLEAN, dust-free spots INSIDE the blue square.",
+        "Use the magnifier for precise placement.",
+        "Press ENTER when done (or 'q' to cancel and use full ROI).",
     ]
 
     # Store all clicked baseline points (original image coords)
