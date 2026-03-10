@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.7"  # User-guided ROI selection (drag-rect); reuse for batch
+TOOL_VERSION = "0.5.8"  # Per-image interactive ROI nudge (arrow keys)
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -858,6 +858,147 @@ def find_roi_user_guided(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
 
 
 # =========================
+# ROI RECT HELPERS
+# =========================
+
+def roi_to_rect(mask_roi):
+    """
+    Extract the bounding rectangle from a binary ROI mask.
+    Returns (x0, y0, x1, y1) in image coordinates.
+    """
+    ys, xs = np.where(mask_roi == 255)
+    if len(ys) == 0:
+        raise RuntimeError("roi_to_rect: empty mask supplied")
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def rect_to_roi(x0, y0, x1, y1, img_h, img_w):
+    """
+    Build (mask_roi, roi_params) from a bounding rectangle.
+    Clamps coordinates to image bounds.
+    Returns (uint8 mask, (cx, cy, half_side)).
+    """
+    x0c = max(0, min(img_w - 1, x0))
+    y0c = max(0, min(img_h - 1, y0))
+    x1c = max(0, min(img_w - 1, x1))
+    y1c = max(0, min(img_h - 1, y1))
+    mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    mask[y0c:y1c + 1, x0c:x1c + 1] = 255
+    cx = (x0c + x1c) // 2
+    cy = (y0c + y1c) // 2
+    half_side = min(x1c - x0c, y1c - y0c) // 2
+    return mask, (cx, cy, half_side)
+
+
+# =========================
+# PER-IMAGE ROI NUDGE
+# =========================
+
+def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
+    """
+    Show a rotated sample image with the ROI rectangle overlaid and let the
+    user nudge its position to compensate for slight frame-to-frame shifts.
+
+    Coarse nudge (arrow keys)  : ±10 px in the respective direction
+    Fine nudge:
+        z / x          : left / right  ±1 px
+        , / .          : up   / down   ±1 px
+    r                  : reset to the position passed in (baseline position)
+    a                  : accept this position for ALL remaining images
+                         (no more nudge windows will appear)
+    Enter / Space      : confirm for this image and advance
+
+    Returns: (x0, y0, x1, y1, apply_to_all)
+        x0/y0/x1/y1  – final rectangle in original-image coordinates
+        apply_to_all – True if the user pressed 'a'
+    """
+    WIN = ("Confirm ROI  |  arrows=10px  z/x=H±1  ,/.=V±1  "
+           "r=reset  a=accept-all  Enter=confirm")
+    h_img, w_img = image_bgr.shape[:2]
+    MAX_W, MAX_H = 1400, 900
+    scale = min(MAX_W / w_img, MAX_H / h_img, 1.0)
+    disp_w = max(1, int(w_img * scale))
+    disp_h = max(1, int(h_img * scale))
+    disp_base = cv2.resize(image_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+    orig_x0, orig_y0, orig_x1, orig_y1 = x0, y0, x1, y1
+    cur_x0, cur_y0, cur_x1, cur_y1 = x0, y0, x1, y1
+    bname = os.path.basename(image_name) if image_name else "image"
+
+    def _clamp(cx0, cy0, cx1, cy1):
+        rw = cx1 - cx0
+        rh = cy1 - cy0
+        cx0 = max(0, min(w_img - rw, cx0))
+        cy0 = max(0, min(h_img - rh, cy0))
+        return cx0, cy0, cx0 + rw, cy0 + rh
+
+    def _render(cx0, cy0, cx1, cy1):
+        disp = disp_base.copy()
+        rx0d = int(cx0 * scale); ry0d = int(cy0 * scale)
+        rx1d = int(cx1 * scale); ry1d = int(cy1 * scale)
+        cv2.rectangle(disp, (rx0d, ry0d), (rx1d, ry1d), (255, 0, 0), 2)
+        dx = cx0 - orig_x0
+        dy = cy0 - orig_y0
+        lines = [
+            f"{bname}  |  offset from baseline: ({dx:+d}, {dy:+d}) px",
+            "arrows=10px  z/x=H-fine  ,/.=V-fine  r=reset  a=accept-all  Enter=confirm",
+        ]
+        for i, txt in enumerate(lines):
+            yy = 28 + i * 26
+            cv2.putText(disp, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+            cv2.putText(disp, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        return disp
+
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, disp_w, disp_h)
+    cv2.imshow(WIN, _render(cur_x0, cur_y0, cur_x1, cur_y1))
+
+    apply_to_all = False
+    while True:
+        key = cv2.waitKey(0)
+        k = key & 0xFFFF
+
+        moved = True
+        if k in (13, 10):                    # Enter -- confirm this image
+            moved = False
+            break
+        elif k in (32,):                     # Space -- also confirm
+            moved = False
+            break
+        elif k == ord('a'):                  # accept-all remaining images
+            apply_to_all = True
+            moved = False
+            break
+        elif k == ord('r'):                  # reset to original position
+            cur_x0, cur_y0, cur_x1, cur_y1 = orig_x0, orig_y0, orig_x1, orig_y1
+        elif k in (81, 63234):               # Left arrow  → 10 px left
+            cur_x0 -= 10; cur_x1 -= 10
+        elif k in (83, 63235):               # Right arrow → 10 px right
+            cur_x0 += 10; cur_x1 += 10
+        elif k in (82, 63232):               # Up arrow    → 10 px up
+            cur_y0 -= 10; cur_y1 -= 10
+        elif k in (84, 63233):               # Down arrow  → 10 px down
+            cur_y0 += 10; cur_y1 += 10
+        elif k == ord('z'):                  # fine left 1 px
+            cur_x0 -= 1; cur_x1 -= 1
+        elif k == ord('x'):                  # fine right 1 px
+            cur_x0 += 1; cur_x1 += 1
+        elif k == ord(','):                  # fine up 1 px
+            cur_y0 -= 1; cur_y1 -= 1
+        elif k == ord('.'):                  # fine down 1 px
+            cur_y0 += 1; cur_y1 += 1
+        else:
+            moved = False
+
+        if moved:
+            cur_x0, cur_y0, cur_x1, cur_y1 = _clamp(cur_x0, cur_y0, cur_x1, cur_y1)
+        cv2.imshow(WIN, _render(cur_x0, cur_y0, cur_x1, cur_y1))
+
+    cv2.destroyWindow(WIN)
+    return cur_x0, cur_y0, cur_x1, cur_y1, apply_to_all
+
+
+# =========================
 # DUST MEASUREMENT
 # =========================
 
@@ -1670,7 +1811,15 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print("  baseline image.  Press 'r' to restart, Enter to confirm.")
     baseline_mask, roi_params = find_roi_user_guided(baseline_image)
     print(f"  ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
-    print("  (ROI will be reused for all images -- card position is fixed)")
+    print("  ROI confirmed. A nudge window will appear for each image so you")
+    print("  can fine-tune the position.  Press 'a' to lock the current position")
+    print("  for all remaining images (skips further nudge prompts).")
+
+    # Extract the ROI as a rectangle for per-image nudge.
+    # base_roi_* holds the original baseline position for offset reporting.
+    cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1 = roi_to_rect(baseline_mask)
+    base_roi_x0, base_roi_y0 = cur_roi_x0, cur_roi_y0
+    apply_roi_to_all = False   # set True when user presses 'a' in nudge window
 
     # Let user interactively select a clean reference region on the untreated sample
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
@@ -1702,7 +1851,32 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # Reuse the baseline ROI for every image (card is fixed; only disc moves).
+
+        # Load + rotate for the ROI confirmation window.
+        # (process_single_image will reload the image independently for the
+        #  actual measurement; this load is only for the interactive preview.)
+        preview = apply_rotation(load_image_any(src_path), rotation_angle)
+        img_h, img_w = preview.shape[:2]
+
+        if not apply_roi_to_all:
+            # Show the image with the current ROI box; let user nudge if needed.
+            nx0, ny0, nx1, ny1, apply_roi_to_all = interactive_roi_nudge(
+                preview,
+                cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1,
+                image_name=fname,
+            )
+            cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1 = nx0, ny0, nx1, ny1
+            if apply_roi_to_all:
+                print(f"  ROI locked at offset "
+                      f"({cur_roi_x0 - base_roi_x0:+d}, "
+                      f"{cur_roi_y0 - base_roi_y0:+d}) px "
+                      f"for all remaining images.")
+
+        # Build the per-image mask from the (possibly adjusted) rectangle.
+        sample_mask, sample_roi_params = rect_to_roi(
+            cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1, img_h, img_w
+        )
+
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1713,8 +1887,8 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             spin_step=spin_step,
             timestamp_str=run_timestamp,
             rotation_angle=rotation_angle,
-            precomputed_mask_roi=baseline_mask,
-            precomputed_roi_params=roi_params,
+            precomputed_mask_roi=sample_mask,
+            precomputed_roi_params=sample_roi_params,
         )
         results.append(res)
 
