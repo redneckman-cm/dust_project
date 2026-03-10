@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.4"  # ROI detected from printed black grid lines, not disc colour
+TOOL_VERSION = "0.5.5"  # morphological line detection + run-width filter for grid ROI
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -303,95 +303,115 @@ def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
     """
     Detect the ROI square from the printed black grid lines on the target card.
 
-    The target card has a grid of black lines (e.g. 3x3 cells).  All grid
-    lines connect at intersections and form ONE connected dark region.  The
-    bounding rectangle of that region defines the outer boundary of the grid,
-    which is the ROI.
+    Strategy: morphological line detection + run-width filtering.
 
-    Steps:
-      1. Grayscale + threshold to isolate near-black pixels.
-      2. Morphological clean-up and slight dilation to join broken segments.
-      3. Find contours; pick the one whose bounding rect is:
-           - large enough (> 15 % of min image dimension on each side)
-           - roughly square (aspect ratio 0.55 - 1.8)
-           - low fill ratio  (lines, not a solid blob) fill < 0.60
-           - closest to the image centre (soft penalty)
-      4. Use the bounding rect of that contour, shrunk inward by `shrink` px.
+    1. Threshold at 50 to isolate near-black ink (sRGB black ink < 30,
+       dark metallic surfaces typically > 60 after gamma).
+    2. Mask out the outer 5 % border so metallic frame edges are ignored.
+    3. MORPH_OPEN with a long horizontal kernel --> keeps only long horizontal
+       strokes; short blobs and vertical features are erased.
+       MORPH_OPEN with a long vertical kernel   --> keeps only long vertical
+       strokes; short blobs and horizontal features are erased.
+    4. Project each result onto its axis (count dark pixels per row/column).
+    5. Group consecutive dark rows/columns into "runs":
+         - NARROW runs (a few px wide) = printed grid lines   --> keep
+         - WIDE runs  (many px tall)   = dark background bands --> discard
+    6. The outermost surviving narrow runs define the grid outer boundary = ROI.
 
     Returns: (mask_roi uint8 0/255, (cx, cy, half_side))
-    Raises:  RuntimeError if no grid-like region is found.
+    Raises:  RuntimeError if at least 2 H-lines + 2 V-lines cannot be found.
     """
     h, w = image_bgr.shape[:2]
-    min_dim = min(h, w)
-    img_cx, img_cy = w / 2.0, h / 2.0
-
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Threshold: capture near-black pixels (printed grid lines should be < ~70)
-    _, dark = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+    # --- Step 1: threshold -- printed black ink is < 50 in 8-bit sRGB ---
+    _, dark = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
 
-    # Remove isolated noise, then lightly dilate to join broken line segments
-    kern_open   = np.ones((3, 3), np.uint8)
-    kern_dilate = np.ones((5, 5), np.uint8)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kern_open, iterations=1)
-    dark = cv2.dilate(dark, kern_dilate, iterations=1)
+    # --- Step 2: ignore the outer border strip (prevents metallic rim detections) ---
+    bdr = max(10, int(min(h, w) * 0.05))
+    dark[:bdr, :] = 0
+    dark[-bdr:, :] = 0
+    dark[:, :bdr] = 0
+    dark[:, -bdr:] = 0
 
-    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise RuntimeError("find_roi_from_grid: no dark regions found in image.")
+    # --- Step 3: morphological line extraction ---
+    # Only strokes >= 1/5 of the image dimension on the relevant axis survive
+    h_len = max(20, w // 5)
+    v_len = max(20, h // 5)
+    horiz = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1)))
+    vert  = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len)))
 
-    best = None
-    best_score = -1e9
+    # --- Step 4: row/column projections ---
+    h_count = np.count_nonzero(horiz, axis=1)   # dark pixels per row
+    v_count = np.count_nonzero(vert,  axis=0)   # dark pixels per column
 
-    for c in contours:
-        area = cv2.contourArea(c)
-        x, y, bw, bh = cv2.boundingRect(c)
+    h_rows = np.where(h_count > w * 0.10)[0]
+    v_cols = np.where(v_count > h * 0.10)[0]
 
-        # Must span a meaningful fraction of the image on both axes
-        if bw < min_dim * 0.15 or bh < min_dim * 0.15:
-            continue
+    # --- Step 5: keep only NARROW runs (grid lines), discard WIDE bands ---
+    def _narrow_line_centers(positions, max_run_px=25):
+        """
+        Group consecutive positions (gap <= 3 px) into runs.
+        Discard runs wider than max_run_px -- those are background bands, not
+        printed grid lines.  Return the centre pixel of each surviving run.
+        """
+        if len(positions) == 0:
+            return []
+        lines = []
+        run = [int(positions[0])]
+        for p in positions[1:]:
+            if int(p) - run[-1] <= 3:
+                run.append(int(p))
+            else:
+                if (run[-1] - run[0] + 1) <= max_run_px:
+                    lines.append(int(round(np.mean(run))))
+                run = [int(p)]
+        if (run[-1] - run[0] + 1) <= max_run_px:
+            lines.append(int(round(np.mean(run))))
+        return lines
 
-        # Must be roughly square (the grid outer boundary is square)
-        aspect = min(bw, bh) / float(max(bw, bh))
-        if aspect < 0.55:
-            continue
+    h_lines = _narrow_line_centers(h_rows)
+    v_lines = _narrow_line_centers(v_cols)
 
-        # Fill ratio: grid lines leave most of the interior empty (white),
-        # so the contour area / bounding-box area should be LOW.
-        fill = area / float(bw * bh)
-        if fill > 0.60:
-            continue  # too solid -- probably noise or a filled blob
-
-        # Prefer contours centred in the image
-        cx_c = x + bw / 2.0
-        cy_c = y + bh / 2.0
-        dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
-
-        # Score: favour large (tight to grid size) and central
-        score = min(bw, bh) - dc * min_dim * 3.0
-
-        if score > best_score:
-            best_score = score
-            best = (x, y, bw, bh)
-
-    if best is None:
+    if len(h_lines) < 2:
         raise RuntimeError(
-            "find_roi_from_grid: could not identify the printed grid square. "
-            "Make sure the black grid lines are visible and the image is in focus."
+            "find_roi_from_grid: fewer than 2 horizontal grid lines found. "
+            "Make sure the grid card is visible and the image is in focus."
+        )
+    if len(v_lines) < 2:
+        raise RuntimeError(
+            "find_roi_from_grid: fewer than 2 vertical grid lines found. "
+            "Make sure the grid card is visible and the image is in focus."
         )
 
-    x, y, bw, bh = best
-    cx_roi = int(x + bw / 2)
-    cy_roi = int(y + bh / 2)
-    half_side = max(5, min(bw, bh) // 2 - shrink)
+    # --- Step 6: outer boundary of surviving narrow runs = grid square ---
+    y_top   = min(h_lines)
+    y_bot   = max(h_lines)
+    x_left  = min(v_lines)
+    x_right = max(v_lines)
 
-    rx0 = max(0, cx_roi - half_side)
-    rx1 = min(w - 1, cx_roi + half_side)
-    ry0 = max(0, cy_roi - half_side)
-    ry1 = min(h - 1, cy_roi + half_side)
+    # Sanity: grid must be a meaningful portion of the image
+    if (y_bot - y_top) < h * 0.10 or (x_right - x_left) < w * 0.10:
+        raise RuntimeError(
+            f"find_roi_from_grid: detected grid region too small "
+            f"({x_right - x_left}x{y_bot - y_top} px in {w}x{h} image). "
+            "Check that the full grid is in frame."
+        )
+
+    # Shrink inward past the line pixels themselves
+    y_top   = min(h - 1, y_top   + shrink)
+    y_bot   = max(0,     y_bot   - shrink)
+    x_left  = min(w - 1, x_left  + shrink)
+    x_right = max(0,     x_right - shrink)
+
+    cx_roi    = (x_left + x_right) // 2
+    cy_roi    = (y_top  + y_bot)   // 2
+    half_side = min((x_right - x_left) // 2, (y_bot - y_top) // 2)
 
     mask_roi = np.zeros((h, w), dtype=np.uint8)
-    mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] = 255
+    mask_roi[y_top : y_bot + 1, x_left : x_right + 1] = 255
 
     return mask_roi, (cx_roi, cy_roi, half_side)
 
