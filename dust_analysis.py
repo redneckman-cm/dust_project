@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.8"  # Per-image interactive ROI nudge (arrow keys)
+TOOL_VERSION = "0.5.9"  # ROI nudge: wasd keys, zoomed crop, centered windows
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -550,6 +550,35 @@ def straighten_and_crop_to_card(image_bgr, padding_px=40):
 
 
 # =========================
+# WINDOW UTILITIES
+# =========================
+
+# Module-level cache so tkinter is only queried once per session.
+_screen_size_cache = [None]   # [0] = (screen_w, screen_h) or None
+
+def _center_window(win_name, win_w, win_h):
+    """
+    Move an OpenCV named window to the centre of the primary monitor.
+    Falls back to 1920×1080 if the screen size cannot be determined.
+    Must be called AFTER cv2.imshow() so the window is mapped on macOS.
+    """
+    if _screen_size_cache[0] is None:
+        sw, sh = 1920, 1080   # safe fallback
+        if TK_AVAILABLE:
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                sw = root.winfo_screenwidth()
+                sh = root.winfo_screenheight()
+                root.destroy()
+            except Exception:
+                pass
+        _screen_size_cache[0] = (sw, sh)
+    sw, sh = _screen_size_cache[0]
+    cv2.moveWindow(win_name, max(0, (sw - win_w) // 2), max(0, (sh - win_h) // 2))
+
+
+# =========================
 # ROTATION HELPERS
 # =========================
 
@@ -644,6 +673,7 @@ def interactive_rotation(image_bgr):
 
     cv2.imshow(WIN, _render(angle))
     cv2.resizeWindow(WIN, disp_w, disp_h)
+    _center_window(WIN, disp_w, disp_h)
 
     while True:
         key = cv2.waitKey(0)
@@ -730,6 +760,9 @@ def find_roi_user_guided(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
             corners.append((orig_x, orig_y))
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, disp_w, disp_h)
+    cv2.imshow(window_name, display_base)   # initial show so moveWindow works
+    _center_window(window_name, disp_w, disp_h)
     cv2.setMouseCallback(window_name, mouse_callback)
 
     while True:
@@ -896,30 +929,27 @@ def rect_to_roi(x0, y0, x1, y1, img_h, img_w):
 
 def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
     """
-    Show a rotated sample image with the ROI rectangle overlaid and let the
-    user nudge its position to compensate for slight frame-to-frame shifts.
+    Show a ZOOMED crop centred on the ROI and let the user nudge its position
+    to compensate for slight frame-to-frame shifts.
 
-    Coarse nudge (arrow keys)  : ±10 px in the respective direction
-    Fine nudge:
-        z / x          : left / right  ±1 px
-        , / .          : up   / down   ±1 px
-    r                  : reset to the position passed in (baseline position)
-    a                  : accept this position for ALL remaining images
-                         (no more nudge windows will appear)
-    Enter / Space      : confirm for this image and advance
+    The view zooms in on the ROI (± 50 % padding on each side) so the edges
+    of the box are clearly visible for precise alignment.
+
+    Coarse nudge : w / a / s / d  – up / left / down / right  ±10 px
+    Fine nudge   : z / x          – left / right               ±1 px
+                   , / .          – up   / down                ±1 px
+    r            : reset to the original position passed in
+    y            : accept this position for ALL remaining images
+    Enter/Space  : confirm for this image and advance
 
     Returns: (x0, y0, x1, y1, apply_to_all)
         x0/y0/x1/y1  – final rectangle in original-image coordinates
-        apply_to_all – True if the user pressed 'a'
+        apply_to_all – True if the user pressed 'y'
     """
-    WIN = ("Confirm ROI  |  arrows=10px  z/x=H±1  ,/.=V±1  "
-           "r=reset  a=accept-all  Enter=confirm")
-    h_img, w_img = image_bgr.shape[:2]
+    WIN = ("Confirm ROI  |  w/a/s/d=10px  z/x=H±1  ,/.=V±1  "
+           "r=reset  y=accept-all  Enter=confirm")
     MAX_W, MAX_H = 1400, 900
-    scale = min(MAX_W / w_img, MAX_H / h_img, 1.0)
-    disp_w = max(1, int(w_img * scale))
-    disp_h = max(1, int(h_img * scale))
-    disp_base = cv2.resize(image_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+    h_img, w_img = image_bgr.shape[:2]
 
     orig_x0, orig_y0, orig_x1, orig_y1 = x0, y0, x1, y1
     cur_x0, cur_y0, cur_x1, cur_y1 = x0, y0, x1, y1
@@ -933,25 +963,58 @@ def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
         return cx0, cy0, cx0 + rw, cy0 + rh
 
     def _render(cx0, cy0, cx1, cy1):
-        disp = disp_base.copy()
-        rx0d = int(cx0 * scale); ry0d = int(cy0 * scale)
-        rx1d = int(cx1 * scale); ry1d = int(cy1 * scale)
-        cv2.rectangle(disp, (rx0d, ry0d), (rx1d, ry1d), (255, 0, 0), 2)
+        # ---- zoomed crop centred on the ROI --------------------------------
+        roi_w = cx1 - cx0
+        roi_h = cy1 - cy0
+        # Context padding: 50 % of the larger ROI dimension, min 80 px
+        ctx = max(80, int(max(roi_w, roi_h) * 0.5))
+        sx0 = max(0, cx0 - ctx)
+        sy0 = max(0, cy0 - ctx)
+        sx1 = min(w_img, cx1 + ctx)
+        sy1 = min(h_img, cy1 + ctx)
+        crop = image_bgr[sy0:sy1, sx0:sx1]
+        ch, cw = crop.shape[:2]
+        if cw == 0 or ch == 0:           # safety fallback
+            crop = image_bgr
+            sx0, sy0 = 0, 0
+            ch, cw = image_bgr.shape[:2]
+
+        # Scale to fit MAX_W × MAX_H (upscaling allowed — that's the zoom)
+        scale = min(MAX_W / cw, MAX_H / ch)
+        out_w = max(1, int(cw * scale))
+        out_h = max(1, int(ch * scale))
+        scaled = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+        # Letterbox onto a fixed MAX_W × MAX_H canvas
+        canvas = np.zeros((MAX_H, MAX_W, 3), dtype=np.uint8)
+        ox = (MAX_W - out_w) // 2
+        oy = (MAX_H - out_h) // 2
+        canvas[oy:oy + out_h, ox:ox + out_w] = scaled
+
+        # ROI rectangle in canvas coordinates
+        rx0d = ox + int((cx0 - sx0) * scale)
+        ry0d = oy + int((cy0 - sy0) * scale)
+        rx1d = ox + int((cx1 - sx0) * scale)
+        ry1d = oy + int((cy1 - sy0) * scale)
+        cv2.rectangle(canvas, (rx0d, ry0d), (rx1d, ry1d), (255, 0, 0), 2)
+
+        # Text overlay
         dx = cx0 - orig_x0
         dy = cy0 - orig_y0
         lines = [
             f"{bname}  |  offset from baseline: ({dx:+d}, {dy:+d}) px",
-            "arrows=10px  z/x=H-fine  ,/.=V-fine  r=reset  a=accept-all  Enter=confirm",
+            "w/a/s/d=10px  z/x=H-fine  ,/.=V-fine  r=reset  y=accept-all  Enter=confirm",
         ]
         for i, txt in enumerate(lines):
             yy = 28 + i * 26
-            cv2.putText(disp, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
-            cv2.putText(disp, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-        return disp
+            cv2.putText(canvas, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+            cv2.putText(canvas, txt, (10, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        return canvas
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, disp_w, disp_h)
+    cv2.resizeWindow(WIN, MAX_W, MAX_H)
     cv2.imshow(WIN, _render(cur_x0, cur_y0, cur_x1, cur_y1))
+    _center_window(WIN, MAX_W, MAX_H)
 
     apply_to_all = False
     while True:
@@ -959,26 +1022,26 @@ def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
         k = key & 0xFFFF
 
         moved = True
-        if k in (13, 10):                    # Enter -- confirm this image
+        if k in (13, 10):                    # Enter — confirm this image
             moved = False
             break
-        elif k in (32,):                     # Space -- also confirm
+        elif k == 32:                        # Space — also confirm
             moved = False
             break
-        elif k == ord('a'):                  # accept-all remaining images
+        elif k == ord('y'):                  # accept-all remaining images
             apply_to_all = True
             moved = False
             break
         elif k == ord('r'):                  # reset to original position
             cur_x0, cur_y0, cur_x1, cur_y1 = orig_x0, orig_y0, orig_x1, orig_y1
-        elif k in (81, 63234):               # Left arrow  → 10 px left
-            cur_x0 -= 10; cur_x1 -= 10
-        elif k in (83, 63235):               # Right arrow → 10 px right
-            cur_x0 += 10; cur_x1 += 10
-        elif k in (82, 63232):               # Up arrow    → 10 px up
+        elif k == ord('w'):                  # coarse up 10 px
             cur_y0 -= 10; cur_y1 -= 10
-        elif k in (84, 63233):               # Down arrow  → 10 px down
+        elif k == ord('s'):                  # coarse down 10 px
             cur_y0 += 10; cur_y1 += 10
+        elif k == ord('a'):                  # coarse left 10 px
+            cur_x0 -= 10; cur_x1 -= 10
+        elif k == ord('d'):                  # coarse right 10 px
+            cur_x0 += 10; cur_x1 += 10
         elif k == ord('z'):                  # fine left 1 px
             cur_x0 -= 1; cur_x1 -= 1
         elif k == ord('x'):                  # fine right 1 px
@@ -1264,6 +1327,9 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             baseline_points.append((orig_x, orig_y))
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, disp_w, disp_h)
+    cv2.imshow(window_name, display_base)   # initial show so moveWindow works
+    _center_window(window_name, disp_w, disp_h)
     cv2.setMouseCallback(window_name, mouse_callback)
 
     while True:
@@ -1811,9 +1877,9 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print("  baseline image.  Press 'r' to restart, Enter to confirm.")
     baseline_mask, roi_params = find_roi_user_guided(baseline_image)
     print(f"  ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
-    print("  ROI confirmed. A nudge window will appear for each image so you")
-    print("  can fine-tune the position.  Press 'a' to lock the current position")
-    print("  for all remaining images (skips further nudge prompts).")
+    print("  ROI confirmed. A zoomed nudge window will appear for each image.")
+    print("  Use w/a/s/d to shift 10 px, z/x/,/. for ±1 px fine nudge.")
+    print("  Press 'y' to lock the current position for all remaining images.")
 
     # Extract the ROI as a rectangle for per-image nudge.
     # base_roi_* holds the original baseline position for offset reporting.
