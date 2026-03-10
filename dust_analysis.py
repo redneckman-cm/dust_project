@@ -26,15 +26,18 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.3.0"  # dust-intensity metric + NEF support    
+TOOL_VERSION = "0.4.0"  # user-guided square ROI selection
 
 # =========================
 # GLOBAL TUNING CONSTANTS
 # =========================
 
-# How far inside detected edge the ROI sits (auto mode)
-AUTO_INNER_SCALE = 0.96     # smaller -> tighter circle inside edge
-INNER_SHRINK = 5            # extra pixels inward from scaled radius
+# User-guided ROI: pixels to shrink inward from each edge after corner clicks
+ROI_CORNER_SHRINK_PX = 5
+
+# Legacy auto-circle constants (kept for reference; auto-detect no longer used in main flow)
+AUTO_INNER_SCALE = 0.96
+INNER_SHRINK = 5
 
 # Only local-contrast pixels above this percentile (inside ROI) are dust
 DUST_PERCENTILE = 92.0      # higher -> fewer pixels marked as dust
@@ -208,6 +211,191 @@ def find_ring_mask_auto(image_bgr, inner_fraction: float = 0.44, inner_shrink: i
 
     return mask_roi, (int(cx), int(cy), int(r_roi))
 
+
+# =========================
+# USER-GUIDED SQUARE ROI
+# =========================
+
+def find_roi_user_guided(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+    """
+    Interactive square ROI selection.
+
+    Shows the image in a resizable window and asks the user to click the
+    4 interior corners of the 1 cm x 1 cm square target (in any order).
+    A magnifier loupe assists with precise placement.
+
+    After 4 clicks the bounding rectangle is shrunk inward by `shrink`
+    pixels on every side and used as the ROI.
+
+    Press 'r' at any time to clear clicks and start over.
+    Press ENTER to confirm once all 4 corners have been clicked.
+
+    Returns:
+        mask_roi  – uint8 (h, w) array, 255 inside ROI, 0 outside
+        roi_params – (cx, cy, half_side) compatible with downstream helpers
+    """
+    h, w = image_bgr.shape[:2]
+
+    # Scale image to fit a reasonable display window
+    MAX_DISP_W, MAX_DISP_H = 1400, 900
+    scale = min(MAX_DISP_W / w, MAX_DISP_H / h, 1.0)
+    disp_w = int(w * scale)
+    disp_h = int(h * scale)
+    display_base = cv2.resize(image_bgr, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+
+    font_scale = max(0.5, min(1.2, disp_w / 1200.0))
+    line_spacing = int(30 * font_scale)
+
+    # Loupe magnifier settings
+    LOUPE_ZOOM = 4.0
+    LOUPE_HALF_SIZE = max(30, int(disp_w * 0.06))
+
+    instructions = [
+        "Click the 4 INTERIOR CORNERS of the 1cm x 1cm square ROI (any order).",
+        "Use the magnifier for precise placement. Press 'r' to restart.",
+        "Press ENTER after all 4 corners are clicked to confirm.",
+    ]
+
+    corners = []       # original-image coordinates
+    mouse_pos = None
+
+    window_name = "Select ROI – Click 4 corners of the square"
+
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal mouse_pos, corners
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_pos = (x, y)
+        elif event == cv2.EVENT_LBUTTONDOWN and len(corners) < 4:
+            orig_x = x / scale
+            orig_y = y / scale
+            corners.append((orig_x, orig_y))
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, mouse_callback)
+
+    while True:
+        disp = display_base.copy()
+
+        # Instructions
+        y_text = int(25 * font_scale)
+        for line in instructions:
+            cv2.putText(disp, line, (10, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (0, 255, 255), 2, cv2.LINE_AA)
+            y_text += line_spacing
+
+        # Click counter
+        count_color = (0, 255, 0) if len(corners) == 4 else (0, 200, 255)
+        cv2.putText(disp, f"Corners clicked: {len(corners)} / 4",
+                    (10, disp_h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                    count_color, 2, cv2.LINE_AA)
+
+        # Draw clicked corners
+        for i, (ox, oy) in enumerate(corners):
+            dx = int(ox * scale)
+            dy = int(oy * scale)
+            cv2.drawMarker(disp, (dx, dy), (0, 0, 255),
+                           cv2.MARKER_CROSS, 20, 2)
+            cv2.putText(disp, str(i + 1), (dx + 8, dy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+
+        # Preview rectangle once all 4 corners are in
+        if len(corners) == 4:
+            pts_dx = [int(c[0] * scale) for c in corners]
+            pts_dy = [int(c[1] * scale) for c in corners]
+            rx0d, rx1d = min(pts_dx), max(pts_dx)
+            ry0d, ry1d = min(pts_dy), max(pts_dy)
+            s_d = max(0, int(shrink * scale))
+            cv2.rectangle(disp,
+                          (rx0d + s_d, ry0d + s_d),
+                          (rx1d - s_d, ry1d - s_d),
+                          (255, 0, 0), 2)
+            cv2.putText(disp, "Blue = final ROI (shrunk by 5 px). Press ENTER to confirm.",
+                        (10, disp_h - 15 - line_spacing),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                        (255, 200, 0), 2, cv2.LINE_AA)
+
+        # Magnifier loupe
+        if mouse_pos is not None:
+            mx, my = mouse_pos
+            x0l = max(mx - LOUPE_HALF_SIZE, 0)
+            y0l = max(my - LOUPE_HALF_SIZE, 0)
+            x1l = min(mx + LOUPE_HALF_SIZE, disp.shape[1] - 1)
+            y1l = min(my + LOUPE_HALF_SIZE, disp.shape[0] - 1)
+            patch = disp[y0l:y1l, x0l:x1l]
+            if patch.size > 0:
+                loupe = cv2.resize(
+                    patch,
+                    (int(patch.shape[1] * LOUPE_ZOOM), int(patch.shape[0] * LOUPE_ZOOM)),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                lh, lw = loupe.shape[:2]
+                # Crosshair
+                cv2.line(loupe, (lw // 2, 0), (lw // 2, lh - 1), (0, 0, 0), 3)
+                cv2.line(loupe, (0, lh // 2), (lw - 1, lh // 2), (0, 0, 0), 3)
+                # Placement
+                ox_l = mx + 20
+                oy_l = my + 20
+                if ox_l + lw > disp.shape[1]:
+                    ox_l = mx - lw - 20
+                if oy_l + lh > disp.shape[0]:
+                    oy_l = my - lh - 20
+                ox_l, oy_l = max(0, ox_l), max(0, oy_l)
+                # Circular blend mask
+                lmask = np.zeros((lh, lw, 3), dtype=np.float32)
+                lradius = min(lh, lw) // 2
+                cv2.circle(lmask, (lw // 2, lh // 2), lradius, (1.0, 1.0, 1.0), -1)
+                sub = disp[oy_l:oy_l + lh, ox_l:ox_l + lw].astype(np.float32)
+                blended = sub * (1.0 - lmask) + loupe.astype(np.float32) * lmask
+                disp[oy_l:oy_l + lh, ox_l:ox_l + lw] = blended.astype(np.uint8)
+                cv2.circle(disp,
+                           (ox_l + lw // 2, oy_l + lh // 2),
+                           lradius, (255, 255, 255), 1)
+
+        cv2.imshow(window_name, disp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == ord('r'):
+            corners = []
+
+        if key in (13, 10) and len(corners) == 4:   # Enter
+            break
+
+    cv2.destroyWindow(window_name)
+
+    # Build rectangle in original-image coordinates and shrink inward
+    orig_xs = [c[0] for c in corners]
+    orig_ys = [c[1] for c in corners]
+
+    rx0 = int(round(min(orig_xs))) + shrink
+    rx1 = int(round(max(orig_xs))) - shrink
+    ry0 = int(round(min(orig_ys))) + shrink
+    ry1 = int(round(max(orig_ys))) - shrink
+
+    rx0 = max(0, rx0)
+    ry0 = max(0, ry0)
+    rx1 = min(w - 1, rx1)
+    ry1 = min(h - 1, ry1)
+
+    if rx1 <= rx0 or ry1 <= ry0:
+        raise RuntimeError(
+            "ROI collapsed after shrinking. Please click the corners more carefully."
+        )
+
+    # Build rectangular mask
+    mask_roi = np.zeros((h, w), dtype=np.uint8)
+    mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] = 255
+
+    cx = (rx0 + rx1) // 2
+    cy = (ry0 + ry1) // 2
+    half_side = min(rx1 - rx0, ry1 - ry0) // 2   # used downstream like circle radius
+
+    print(f"  ROI rectangle: ({rx0}, {ry0}) – ({rx1}, {ry1}), "
+          f"center ({cx}, {cy}), half-side {half_side} px")
+
+    return mask_roi, (cx, cy, half_side)
 
 
 # =========================
@@ -698,7 +886,8 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
 
 
 def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_override=None, debug=False,
-                         sample_name=None, spin_step=None, timestamp_str=None):
+                         sample_name=None, spin_step=None, timestamp_str=None,
+                         precomputed_mask_roi=None, precomputed_roi_params=None):
     """
     Process a single image:
       - detect circle ROI
@@ -727,8 +916,12 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
         # Save the NEF-loaded image as a JPG preview for the report
         cv2.imwrite(raw_display_path, image)
 
-    # Detect ROI and measure dust
-    mask_roi, circle = find_ring_mask_auto(image)
+    # Use precomputed user-guided ROI if available, otherwise fall back to auto-detect
+    if precomputed_mask_roi is not None and precomputed_roi_params is not None:
+        mask_roi = precomputed_mask_roi
+        circle = precomputed_roi_params
+    else:
+        mask_roi, circle = find_ring_mask_auto(image)
     dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score = measure_dust(
         image,
         mask_roi,
@@ -769,8 +962,13 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
 
     overlay = (base_f * (1.0 - alpha) + red_img * alpha).astype(np.uint8)
 
-    # Draw ROI circle on top
-    cv2.circle(overlay, (circle[0], circle[1]), circle[2], (255, 0, 0), 2)
+    # Draw ROI boundary on overlay (rectangle for user-guided square ROI)
+    ys_roi, xs_roi = np.where(mask_roi == 255)
+    if len(xs_roi) > 0:
+        cv2.rectangle(overlay,
+                      (int(xs_roi.min()), int(ys_roi.min())),
+                      (int(xs_roi.max()), int(ys_roi.max())),
+                      (255, 0, 0), 2)
 
     # Crop around ROI and add footer with metadata
     cropped_with_footer = create_cropped_highlight_with_footer(
@@ -990,7 +1188,10 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print(f"Baseline reference image: {baseline_fname}")
 
     baseline_image = load_image_any(baseline_path)
-    baseline_mask, _ = find_ring_mask_auto(baseline_image)
+
+    # Ask user to define the ROI once (shared across all images in this run)
+    print("\nROI selection: click the 4 interior corners of the 1cm x 1cm square target.")
+    baseline_mask, roi_params = find_roi_user_guided(baseline_image)
 
     # Let user interactively select a clean reference region on the untreated sample
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
@@ -1022,7 +1223,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # Process and create highlight in sample_dir
+        # Process and create highlight in sample_dir (same ROI for every image)
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1032,6 +1233,8 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             sample_name=sample_name,
             spin_step=spin_step,
             timestamp_str=run_timestamp,
+            precomputed_mask_roi=baseline_mask,
+            precomputed_roi_params=roi_params,
         )
         results.append(res)
 
