@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.5"  # morphological line detection + run-width filter for grid ROI
+TOOL_VERSION = "0.5.6"  # Sharpie-aware run-width filter; reuse baseline ROI for batch
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -324,8 +324,11 @@ def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
     h, w = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    # --- Step 1: threshold -- printed black ink is < 50 in 8-bit sRGB ---
-    _, dark = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+    # --- Step 1: threshold ---
+    # Use 70 (generous) so Sharpie ink is captured even where the disc sits on
+    # top of it.  Fine metallic lines are kept too, but the run-width filter
+    # below removes them.
+    _, dark = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
 
     # --- Step 2: ignore the outer border strip (prevents metallic rim detections) ---
     bdr = max(10, int(min(h, w) * 0.05))
@@ -335,9 +338,10 @@ def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
     dark[:, -bdr:] = 0
 
     # --- Step 3: morphological line extraction ---
-    # Only strokes >= 1/5 of the image dimension on the relevant axis survive
-    h_len = max(20, w // 5)
-    v_len = max(20, h // 5)
+    # Sharpie lines can be partially hidden by the disc, so use a shorter
+    # minimum length (1/8 of dimension) to catch even broken segments.
+    h_len = max(20, w // 8)
+    v_len = max(20, h // 8)
     horiz = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
                              cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1)))
     vert  = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
@@ -347,16 +351,23 @@ def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
     h_count = np.count_nonzero(horiz, axis=1)   # dark pixels per row
     v_count = np.count_nonzero(vert,  axis=0)   # dark pixels per column
 
-    h_rows = np.where(h_count > w * 0.10)[0]
-    v_cols = np.where(v_count > h * 0.10)[0]
+    h_rows = np.where(h_count > w * 0.05)[0]    # 5%: catches partially-visible lines
+    v_cols = np.where(v_count > h * 0.05)[0]
 
-    # --- Step 5: keep only NARROW runs (grid lines), discard WIDE bands ---
-    def _narrow_line_centers(positions, max_run_px=25):
-        """
-        Group consecutive positions (gap <= 3 px) into runs.
-        Discard runs wider than max_run_px -- those are background bands, not
-        printed grid lines.  Return the centre pixel of each surviving run.
-        """
+    # --- Step 5: run-width band-pass filter ---
+    # The Sharpie marker makes THICK lines.  Fine metallic lines are thin.
+    # Dark metallic background bands are very wide.
+    #
+    #   run width < MIN_PX  --> fine metallic line  --> discard
+    #   MIN_PX <= run <= MAX_PX --> Sharpie grid line --> KEEP
+    #   run width > MAX_PX  --> dark background band --> discard
+    #
+    # After the morphological OPEN each printed Sharpie line shows as a run
+    # of consecutive dark rows/columns a few to ~60 px wide.
+    MIN_LINE_PX = 4    # thinner than this = fine metallic line
+    MAX_LINE_PX = 80   # wider than this = dark background band
+
+    def _gridline_centers(positions):
         if len(positions) == 0:
             return []
         lines = []
@@ -365,15 +376,17 @@ def find_roi_from_grid(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
             if int(p) - run[-1] <= 3:
                 run.append(int(p))
             else:
-                if (run[-1] - run[0] + 1) <= max_run_px:
+                rw = run[-1] - run[0] + 1
+                if MIN_LINE_PX <= rw <= MAX_LINE_PX:
                     lines.append(int(round(np.mean(run))))
                 run = [int(p)]
-        if (run[-1] - run[0] + 1) <= max_run_px:
+        rw = run[-1] - run[0] + 1
+        if MIN_LINE_PX <= rw <= MAX_LINE_PX:
             lines.append(int(round(np.mean(run))))
         return lines
 
-    h_lines = _narrow_line_centers(h_rows)
-    v_lines = _narrow_line_centers(v_cols)
+    h_lines = _gridline_centers(h_rows)
+    v_lines = _gridline_centers(v_cols)
 
     if len(h_lines) < 2:
         raise RuntimeError(
@@ -1650,11 +1663,12 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print(f"  Rotation angle confirmed: {rotation_angle:+.1f} deg")
     baseline_image = apply_rotation(baseline_image, rotation_angle)
 
-    # Auto-detect the ROI square from the baseline disc (square inscribed in disc).
-    # Each processed image re-detects its own ROI to track disc movement between shots.
-    print("\nAuto-detecting ROI from printed grid lines in baseline image...")
+    # Detect the ROI once from the baseline.  The printed grid is fixed on the
+    # card for the entire batch, so all sample images reuse the same ROI.
+    print("\nAuto-detecting ROI from printed Sharpie grid lines in baseline image...")
     baseline_mask, roi_params = find_roi_from_grid(baseline_image)
     print(f"ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
+    print("  (ROI will be reused for all images -- card position is fixed)")
 
     # Let user interactively select a clean reference region on the untreated sample
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
@@ -1686,7 +1700,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # Apply the same rotation the user set on the baseline; ROI auto-detected per image.
+        # Reuse the baseline ROI for every image (card is fixed; only disc moves).
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1697,6 +1711,8 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             spin_step=spin_step,
             timestamp_str=run_timestamp,
             rotation_angle=rotation_angle,
+            precomputed_mask_roi=baseline_mask,
+            precomputed_roi_params=roi_params,
         )
         results.append(res)
 
