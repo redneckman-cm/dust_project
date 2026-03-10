@@ -222,6 +222,132 @@ def find_ring_mask_auto(image_bgr, inner_fraction: float = 0.44, inner_shrink: i
 
 
 # =========================
+# AUTO-DETECT SQUARE ROI
+# =========================
+
+def find_roi_auto(image_bgr, shrink=ROI_CORNER_SHRINK_PX):
+    """
+    Auto-detect the ROI square per image by finding the colored disc (orange /
+    yellow / green / pink) and inscribing a square inside it.
+
+    Called once per image, so the ROI correctly tracks the disc even when the
+    physical sample moves between shots.
+
+    Returns: (mask_roi uint8 0/255, (cx, cy, half_side))
+    """
+    h, w = image_bgr.shape[:2]
+    min_dim = min(h, w)
+    img_cx, img_cy = w / 2.0, h / 2.0
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    color_ranges = [
+        (np.array([15, 80, 80],  dtype=np.uint8), np.array([40, 255, 255], dtype=np.uint8)),  # yellow
+        (np.array([5,  80, 80],  dtype=np.uint8), np.array([20, 255, 255], dtype=np.uint8)),  # orange
+        (np.array([40, 40, 40],  dtype=np.uint8), np.array([80, 255, 255], dtype=np.uint8)),  # green
+        (np.array([160, 60, 60], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8)), # pink
+        (np.array([0,  60, 60],  dtype=np.uint8), np.array([10, 255, 255], dtype=np.uint8)),  # pink wrap
+    ]
+
+    best_ring = None
+    best_score = -1e9
+    kernel = np.ones((5, 5), np.uint8)
+
+    for lower, upper in color_ranges:
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < (min_dim * min_dim * 0.002):
+                continue
+            (cx_c, cy_c), r_c = cv2.minEnclosingCircle(c)
+            cx_c, cy_c, r_c = float(cx_c), float(cy_c), float(r_c)
+            dc = np.hypot(cx_c - img_cx, cy_c - img_cy) / min_dim
+            if dc > 0.45:          # disc can be off-centre; be more lenient than old ring finder
+                continue
+            if not (min_dim * 0.06 < r_c < min_dim * 0.40):
+                continue
+            score = area - (dc * 5000.0)
+            if score > best_score:
+                best_score = score
+                best_ring = (cx_c, cy_c, r_c)
+
+    if best_ring is None:
+        raise RuntimeError(
+            "find_roi_auto: could not detect the colored disc. "
+            "Check that the sample is visible and the color matches a known range."
+        )
+
+    cx, cy, r = best_ring
+    # Inscribed square: half_side = r / sqrt(2), then shrink inward
+    half_side = max(5, int(r / np.sqrt(2)) - shrink)
+
+    rx0 = max(0, int(cx) - half_side)
+    rx1 = min(w - 1, int(cx) + half_side)
+    ry0 = max(0, int(cy) - half_side)
+    ry1 = min(h - 1, int(cy) + half_side)
+
+    mask_roi = np.zeros((h, w), dtype=np.uint8)
+    mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] = 255
+
+    return mask_roi, (int(cx), int(cy), half_side)
+
+
+def straighten_image(image_bgr, max_correction_deg=15.0):
+    """
+    Detect small camera tilt using probabilistic Hough lines on the image
+    and correct it with an affine rotation.
+
+    Only corrects angles smaller than max_correction_deg to avoid large
+    misdetections. Returns (corrected_image, angle_applied_deg).
+    angle_applied_deg > 0 means the image was rotated clockwise.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    h, w = image_bgr.shape[:2]
+    min_line_len = max(w // 6, 100)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=80,
+        minLineLength=min_line_len,
+        maxLineGap=20,
+    )
+
+    if lines is None:
+        return image_bgr, 0.0
+
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        # Keep only nearly-horizontal lines
+        if abs(a) < 20:
+            angles.append(a)
+        elif abs(a) > 160:
+            angles.append(a - 180)
+
+    if len(angles) < 3:
+        return image_bgr, 0.0
+
+    skew = float(np.median(angles))   # positive → lines tilt CW; negative → tilt CCW
+
+    if abs(skew) < 0.1 or abs(skew) > max_correction_deg:
+        return image_bgr, 0.0
+
+    # Rotate image by -skew to level horizontal lines
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, -skew, 1.0)
+    corrected = cv2.warpAffine(
+        image_bgr, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+    return corrected, skew
+
+
+# =========================
 # USER-GUIDED SQUARE ROI
 # =========================
 
@@ -897,10 +1023,12 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
 
 def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_override=None, debug=False,
                          sample_name=None, spin_step=None, timestamp_str=None,
-                         precomputed_mask_roi=None, precomputed_roi_params=None):
+                         precomputed_mask_roi=None, precomputed_roi_params=None,
+                         rotation_angle=0.0):
     """
     Process a single image:
-      - detect circle ROI
+      - (optionally) straighten by rotation_angle degrees
+      - auto-detect square ROI from the colored disc, or use precomputed ROI
       - measure dust
       - compute a continuous dust_intensity metric from dust_score
       - save dust-highlight overlay
@@ -911,27 +1039,36 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
     if image is None:
         raise RuntimeError(f"Could not read image: {img_path}")
 
+    # Apply straightening rotation if one was detected from the baseline
+    if abs(rotation_angle) > 0.05:
+        h, w = image.shape[:2]
+        center = (w / 2.0, h / 2.0)
+        M = cv2.getRotationMatrix2D(center, -rotation_angle, 1.0)
+        image = cv2.warpAffine(image, M, (w, h),
+                               flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REFLECT_101)
+
     # Figure out base names / extensions
     base_name = os.path.basename(img_path)
     stem, ext = os.path.splitext(base_name)
     ext_lower = ext.lower()
 
-    # Decide what file the HTML report should use for the “Raw” preview
+    # Decide what file the HTML report should use for the "Raw" preview
     # For normal images → use the original file
     # For NEF → create a JPG preview: <stem>_raw.jpg
     raw_display_name = base_name
     if ext_lower == ".nef":
         raw_display_name = f"{stem}_raw.jpg"
         raw_display_path = os.path.join(out_dir, raw_display_name)
-        # Save the NEF-loaded image as a JPG preview for the report
+        # Save the (straightened) NEF-loaded image as a JPG preview for the report
         cv2.imwrite(raw_display_path, image)
 
-    # Use precomputed user-guided ROI if available, otherwise fall back to auto-detect
+    # Use precomputed ROI if supplied, otherwise auto-detect per image
     if precomputed_mask_roi is not None and precomputed_roi_params is not None:
         mask_roi = precomputed_mask_roi
         circle = precomputed_roi_params
     else:
-        mask_roi, circle = find_ring_mask_auto(image)
+        mask_roi, circle = find_roi_auto(image)
     dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score = measure_dust(
         image,
         mask_roi,
@@ -1199,9 +1336,19 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
 
     baseline_image = load_image_any(baseline_path)
 
-    # Ask user to define the ROI once (shared across all images in this run)
-    print("\nROI selection: click the 4 interior corners of the 1cm x 1cm square target.")
-    baseline_mask, roi_params = find_roi_user_guided(baseline_image)
+    # Auto-detect and correct small camera tilt from the baseline image.
+    # The same rotation angle is applied to every image for consistency.
+    baseline_image, skew_angle = straighten_image(baseline_image)
+    if abs(skew_angle) > 0.1:
+        print(f"Auto-straighten: correcting {skew_angle:+.2f}deg tilt in all images.")
+    else:
+        print("Auto-straighten: no significant tilt detected.")
+
+    # Auto-detect the ROI square from the baseline disc (square inscribed in disc).
+    # ROI is also re-detected per image in process_single_image so it tracks disc movement.
+    print("\nAuto-detecting ROI from colored disc in baseline image...")
+    baseline_mask, roi_params = find_roi_auto(baseline_image)
+    print(f"ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
 
     # Let user interactively select a clean reference region on the untreated sample
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
@@ -1233,7 +1380,8 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.copy2(src_path, processed_copy_path)
 
         spin_step = i + 1
-        # Process and create highlight in sample_dir (same ROI for every image)
+        # ROI is auto-detected per image so it tracks disc movement between shots.
+        # Straightening rotation (detected from baseline) is applied consistently.
         res = process_single_image(
             src_path,
             sample_dir,
@@ -1243,8 +1391,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             sample_name=sample_name,
             spin_step=spin_step,
             timestamp_str=run_timestamp,
-            precomputed_mask_roi=baseline_mask,
-            precomputed_roi_params=roi_params,
+            rotation_angle=skew_angle,
         )
         results.append(res)
 
