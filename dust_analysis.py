@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.5.6"  # Sharpie-aware run-width filter; reuse baseline ROI for batch
+TOOL_VERSION = "0.5.7"  # User-guided ROI selection (drag-rect); reuse for batch
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -1663,11 +1663,13 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print(f"  Rotation angle confirmed: {rotation_angle:+.1f} deg")
     baseline_image = apply_rotation(baseline_image, rotation_angle)
 
-    # Detect the ROI once from the baseline.  The printed grid is fixed on the
-    # card for the entire batch, so all sample images reuse the same ROI.
-    print("\nAuto-detecting ROI from printed Sharpie grid lines in baseline image...")
-    baseline_mask, roi_params = find_roi_from_grid(baseline_image)
-    print(f"ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
+    # Let the user draw the ROI rectangle on the baseline image.
+    # The card is fixed for the entire batch, so every sample image reuses
+    # this same ROI -- no per-image detection needed.
+    print("\nROI selection: click the 4 corners of the Sharpie grid square in the")
+    print("  baseline image.  Press 'r' to restart, Enter to confirm.")
+    baseline_mask, roi_params = find_roi_user_guided(baseline_image)
+    print(f"  ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
     print("  (ROI will be reused for all images -- card position is fixed)")
 
     # Let user interactively select a clean reference region on the untreated sample
