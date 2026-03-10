@@ -26,7 +26,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.6.2"  # Sweet-spot constants: SIGMA_K=0.25, MIN_ABS_DELTA=0.4, percentile=98.5
+TOOL_VERSION = "0.6.3"  # IOD (Integrated Optical Density) metric replaces binary thresholding
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -1067,14 +1067,20 @@ def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
 
 def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=None):
     """
-    Compute a dust metric inside the ROI using local contrast:
-      - blur the image
-      - diff = blur - gray
-      - treat only the strongest local-dark specks (top DUST_PERCENTILE) as dust
+    Compute a dust metric inside the ROI.
+
+    When baseline_stats is None: local-contrast percentile method (no baseline image).
+
+    When baseline_stats is provided: IOD (Integrated Optical Density) method.
+      1. delta = base_mean - gray_pixel  (positive = darker than baseline)
+      2. 3-sigma noise floor: delta = 0 where delta < 3 * base_std
+      3. opacity = delta / base_mean  (clamped to [0, 1])
+      4. mean_opacity = sum(opacity) / total_roi_pixels
 
     Returns:
-      dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
-      where dust_score is a per-pixel float32 map indicating dust "darkness" (for visualization).
+      metric, dust_pixels, total_pixels, dust_binary, dust_score
+      metric     = dust_fraction (no-baseline mode) or mean_opacity (IOD mode)
+      dust_score = per-pixel float32 opacity map (used for red heatmap visualization)
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     roi = (mask_roi == 255)
@@ -1109,10 +1115,10 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
         return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
     else:
-        # Baseline-based detection: simple absolute comparison to the baseline mean.
-        # No shading-correction blur — every pixel in the ROI is measured against
-        # the same fixed reference value (base_mean) so the "yardstick" is identical
-        # for every image in the batch.  A perfectly clean image returns 0 % dust.
+        # IOD (Integrated Optical Density) approach.
+        # Measures both the area and the density of dust in a single metric, which
+        # correlates directly to dust mass remaining on the surface.  Scientifically
+        # defensible: mean_opacity = 0.0 for a clean image, 1.0 for fully opaque.
         base_mean, base_std = baseline_stats
 
         if base_std < 1e-3:
@@ -1120,43 +1126,35 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
         gray_f = gray.astype(np.float32)
 
-        # Positive delta = pixel is darker than the baseline mean.
-        delta = base_mean - gray_f
+        # Step 1: Per-pixel delta — positive where pixel is darker than baseline mean.
+        delta = (base_mean - gray_f).astype(np.float32)
 
-        # Determine the darkness threshold (sigma-based default, or fixed override).
-        k = BASELINE_SIGMA_K
-        sigma_thresh = k * base_std
-        abs_thresh = BASELINE_MIN_ABS_DELTA
-        dark_thresh = max(sigma_thresh, abs_thresh)
+        # Step 2: 3-sigma noise floor (standard signal/noise criterion).
+        # Zero out any pixel whose darkening falls within normal baseline variation.
+        noise_floor = 3.0 * base_std
+        delta[delta < noise_floor] = 0.0
+        delta[~roi] = 0.0
 
-        # A calibration-derived fixed threshold always wins when supplied.
-        if dark_thresh_override is not None:
-            dark_thresh = float(dark_thresh_override)
-
-        # Dust = pixels inside ROI that are darker than the fixed threshold.
-        # No percentile fallback: a clean image genuinely returns 0 %.
-        dust_mask = (delta > dark_thresh) & roi
-
-        dust_binary = np.zeros_like(gray, dtype=np.uint8)
-        dust_binary[dust_mask] = 255
-
-        dust_pixels = np.count_nonzero(dust_binary == 255)
-        dust_fraction = dust_pixels / float(total_pixels)
-
-        # Visualization score: normalize to a FIXED scale so red intensity is
-        # consistent across the batch.  4 × threshold = full red; anything above
-        # is clamped.  This prevents a nearly-clean image from looking as red as
-        # a very dirty one just because both are normalized to their own maximum.
-        delta_pos = delta.copy()
-        delta_pos[delta_pos < 0] = 0
-        delta_pos[~roi] = 0
-        fixed_scale = dark_thresh * 4.0
-        if fixed_scale > 0:
-            dust_score = np.clip(delta_pos / fixed_scale, 0.0, 1.0).astype(np.float32)
+        # Step 3: Normalize by baseline mean → per-pixel Opacity Score in [0, 1].
+        # 0.0 = same brightness as baseline (clean); 1.0 = totally opaque (black).
+        if base_mean > 0:
+            opacity = np.clip(delta / base_mean, 0.0, 1.0).astype(np.float32)
         else:
-            dust_score = np.zeros_like(delta_pos, dtype=np.float32)
+            opacity = np.zeros_like(delta, dtype=np.float32)
 
-        return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
+        # Step 4: Mean Opacity across the entire ROI — the primary IOD metric.
+        # Dividing by total_pixels (not nonzero count) correctly penalises sparse dust.
+        mean_opacity = float(np.sum(opacity) / total_pixels)
+
+        # dust_binary: pixels that cleared the noise floor (for visualization overlay).
+        dust_binary = np.zeros_like(gray, dtype=np.uint8)
+        dust_binary[opacity > 0] = 255
+        dust_pixels = np.count_nonzero(dust_binary == 255)
+
+        # dust_score: per-pixel opacity map fed to the red heatmap renderer.
+        dust_score = opacity
+
+        return mean_opacity, dust_pixels, total_pixels, dust_binary, dust_score
 
 # =========================
 # BASELINE DARK THRESHOLD CALIBRATION
@@ -1504,7 +1502,7 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
         line2 = f"Spin speed / step: {spin_step}"
     else:
         line2 = "Spin speed / step: n/a"
-    line3 = f"Dust coverage: {dust_fraction * 100.0:.2f}%"
+    line3 = f"Mean Opacity (IOD): {dust_fraction * 100.0:.2f}%"
 
     lines = [line1, line2, line3]
 
@@ -1666,7 +1664,7 @@ def make_sample_plot(sample_dir, sample_name, results):
     intensity = [r.get("dust_intensity", 0.0) * 100.0 for r in results]
 
     plt.figure()
-    plt.plot(xs, coverage, marker="o", label="Coverage area (%)")
+    plt.plot(xs, coverage, marker="o", label="Mean Opacity / IOD (%)")
     plt.plot(xs, intensity, marker="s", linestyle="--", label="Intensity (normalized)")
     plt.xlabel("Spin step (image index)")
     plt.ylabel("Dust metric (%)")
@@ -1782,8 +1780,8 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images):
       <tr>
         <th>Image name</th>
         <th>Spin speed (step)</th>
-        <th>Dust coverage (%)</th>
-        <th>Dust intensity (normalized %)</th>
+        <th>Mean Opacity / IOD (%)</th>
+        <th>Intensity (normalized %)</th>
       </tr>
     </thead>
     <tbody>
@@ -1870,18 +1868,11 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
     print(f"Baseline stats (gray mean, std): {baseline_stats[0]:.2f}, {baseline_stats[1]:.2f}")
 
-    # Calibrate a fixed darkness threshold from the baseline image (the cleanest
-    # image in the batch — the "yardstick").  Every image in the batch uses the
-    # same threshold so sensitivity cannot auto-adjust as images get cleaner.
-    print("\nCalibrating fixed darkness threshold from baseline image...")
-    baseline_dark_thresh = compute_baseline_dark_threshold(
-        baseline_image, baseline_mask, baseline_stats
-    )
-    if baseline_dark_thresh is not None:
-        print(f"  Fixed threshold: {baseline_dark_thresh:.3f} gray levels above baseline mean")
-        print("  (applied to every image — a clean image will return 0 % dust)")
-    else:
-        print("  Warning: threshold calibration failed; falling back to per-image default.")
+    # IOD mode: noise floor is always 3 × base_std, computed inside measure_dust.
+    # No separate threshold calibration step needed.
+    baseline_dark_thresh = None  # unused in IOD mode; kept for API compatibility
+    print(f"\nIOD noise floor: 3 × baseline std = {3.0 * baseline_stats[1]:.3f} gray levels")
+    print("  Pixels darker than this are measured; a clean image returns mean_opacity = 0.0")
 
     out_root = "results"
     os.makedirs(out_root, exist_ok=True)
