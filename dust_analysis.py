@@ -80,7 +80,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.7.2"  # P90 percentile baseline, blank calibration, PAC + PRE metrics
+TOOL_VERSION = "0.7.5"  # LAB b* detection, mean baseline, split IOD/PAC sigma, colour heatmap
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -1816,21 +1816,20 @@ def make_sample_plot(sample_dir, sample_name, results):
     Right y-axis (0–100%): PRE (Particle Removal Efficiency) — represents
     "how much dust has been removed" and trends upward.
     """
-    xs = [i + 1 for i in range(len(results))]
+    xs = list(range(len(results)))  # step 0 = first dusted image (no spin)
     coverage = [r["dust_fraction"] * 100.0 for r in results]
-    intensity = [r.get("dust_intensity", 0.0) * 100.0 for r in results]
     pac = [r.get("pac", 0.0) for r in results]
     pre = [r.get("pre", 0.0) for r in results]
 
     fig, ax1 = plt.subplots()
 
     # Left y-axis: dust-presence metrics
-    l1 = ax1.plot(xs, coverage, marker="o", color="tab:blue", label="Mean Opacity / IOD (%)")
-    l2 = ax1.plot(xs, intensity, marker="s", linestyle="--", color="tab:orange", label="Intensity (normalized)")
+    l1 = ax1.plot(xs, coverage, marker="o", color="tab:blue", label="IOD (%)")
     l3 = ax1.plot(xs, pac, marker="^", linestyle="-.", color="tab:red", label="PAC (%)")
-    ax1.set_xlabel("Spin step (image index)")
+    ax1.set_xlabel("Spin step (0 = dusted, no spin)")
     ax1.set_ylabel("Dust metric (%)")
     ax1.set_ylim(0, 100)
+    ax1.set_xticks(xs)
     ax1.grid(True)
 
     # Right y-axis: removal efficiency
@@ -1840,7 +1839,7 @@ def make_sample_plot(sample_dir, sample_name, results):
     ax2.set_ylim(0, 100)
 
     # Combined legend
-    lines = l1 + l2 + l3 + l4
+    lines = l1 + l3 + l4
     labels = [l.get_label() for l in lines]
     ax1.legend(lines, labels, loc="best")
 
@@ -1876,9 +1875,9 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images, blank
     plot_path = make_sample_plot(sample_dir, sample_name, results)
     plot_name = os.path.basename(plot_path) if plot_path else None
 
-    # Map image name -> spin step (1,2,3,...) based on moved_images order
+    # Map image name -> spin step (0,1,2,...) — step 0 = first dusted image, no spin
     name_to_step = {
-        os.path.basename(p): i + 1 for i, p in enumerate(moved_images)
+        os.path.basename(p): i for i, p in enumerate(moved_images)
     }
 
     # Build a quick lookup: image name -> result dict
@@ -1889,15 +1888,14 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images, blank
     for r in results:
         img_name = r["image"]
         step = name_to_step.get(img_name, "")
-        dust_pct = r["dust_fraction"] * 100.0
-        dust_intensity = r.get("dust_intensity", 0.0) * 100.0
         pac_val = r.get("pac", 0.0)
         pre_val = r.get("pre", 0.0)
         pre_str = f"{pre_val:.2f}%" if not math.isnan(pre_val) else "N/A"
+        iod_pct = r["dust_fraction"] * 100.0
         table_rows.append(
             f"<tr><td>{img_name}</td><td>{step}</td>"
-            f"<td>{dust_pct:.2f}%</td><td>{dust_intensity:.2f}%</td>"
-            f"<td>{pac_val:.2f}%</td><td>{pre_str}</td></tr>"
+            f"<td>{pac_val:.2f}%</td><td>{pre_str}</td>"
+            f"<td>{iod_pct:.2f}%</td></tr>"
         )
     table_html = "\n".join(table_rows)
 
@@ -1949,10 +1947,14 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images, blank
 <body>
   <h1>Dust Report – {sample_name}</h1>
   <p style="color:#555; font-size:0.9em;">
-    Tool version {TOOL_VERSION}.
-    Baseline calibrated to the 90th percentile (P90) of clean reference intensity
-    (accounts for surface rugosity). Dust threshold = P90 baseline &minus; 3&sigma;.
-    {"Full-ROI blank reference calibration." if blank_calibration else "Manual patch calibration."}
+    Tool version {TOOL_VERSION}. &nbsp;
+    <strong>Detection:</strong> LAB b* (Yellow&ndash;Blue axis) &mdash; isolates colour loss caused
+    by achromatic dust on a coloured substrate; robust to illumination changes that affect
+    brightness (L*) only. &nbsp;
+    <strong>Baseline:</strong> {"mean b* of full ROI from blank reference image (Step 0, not measured)." if blank_calibration else "mean b* from manually selected clean patches on the last image."} &nbsp;
+    <strong>IOD threshold:</strong> baseline b* &minus; {IOD_SIGMA:.0f}&sigma; (continuous colour-shift metric). &nbsp;
+    <strong>PAC threshold:</strong> baseline b* &minus; {PAC_SIGMA:.0f}&sigma; (binary area classification). &nbsp;
+    <strong>PRE:</strong> Particle Removal Efficiency relative to Step 0 (first dusted image, no spin).
   </p>
 
   <h2>Dust vs Spin Step</h2>
@@ -1964,10 +1966,9 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images, blank
       <tr>
         <th>Image name</th>
         <th>Spin speed (step)</th>
-        <th>Mean Opacity / IOD (%)</th>
-        <th>Intensity (normalized %)</th>
         <th>PAC (%)</th>
         <th>PRE (%)</th>
+        <th>IOD (%)</th>
       </tr>
     </thead>
     <tbody>
@@ -2066,7 +2067,9 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     # IOD mode: noise floor is always 3 × base_std, computed inside measure_dust.
     # No separate threshold calibration step needed.
     baseline_dark_thresh = None  # unused in IOD mode; kept for API compatibility
-    print(f"\nIOD noise floor: 3 × baseline std = {3.0 * baseline_stats[1]:.3f} gray levels")
+    print(f"\nBaseline b*: mean={baseline_stats[0]:.2f}, std={baseline_stats[1]:.2f}")
+    print(f"  IOD noise floor: {IOD_SIGMA:.0f}σ = {IOD_SIGMA * baseline_stats[1]:.3f} b* units")
+    print(f"  PAC threshold:   {PAC_SIGMA:.0f}σ = {PAC_SIGMA * baseline_stats[1]:.3f} b* units below baseline")
     print("  Pixels darker than this are measured; a clean image returns mean_opacity = 0.0")
 
     out_root = "results"
@@ -2101,7 +2104,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         processed_copy_path = os.path.join(processed_dir, fname)
         shutil.copy2(src_path, processed_copy_path)
 
-        spin_step = i + 1
+        spin_step = i  # step 0 = first dusted image (no spin yet)
 
         # Load + rotate for the ROI confirmation window.
         # (process_single_image will reload the image independently for the
@@ -2153,27 +2156,25 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     for r, pre in zip(results, pre_values):
         r['pre'] = pre
 
-    # Build rows with sample + spin_step
+    # Build rows with sample + spin_step (0 = first dusted image, no spin)
     rows = []
     for i, r in enumerate(results):
-        step = i + 1  # spin step based on order
         rows.append({
             "sample": sample_name,
-            "spin_step": step,
+            "spin_step": i,
             "image": r["image"],
-            "dust_fraction": r["dust_fraction"],
-            "dust_pixels": r["dust_pixels"],
-            "total_pixels": r["total_pixels"],
-            "dust_intensity": r.get("dust_intensity", 0.0),
             "pac": r.get("pac", 0.0),
             "pre": r.get("pre", 0.0),
+            "iod": r["dust_fraction"],
+            "dust_pixels": r["dust_pixels"],
+            "total_pixels": r["total_pixels"],
         })
 
     # --- Per-sample CSV ---
     csv_path = os.path.join(sample_dir, f"dust_results_{sample_name}.csv")
     fieldnames = ["sample", "spin_step", "image",
-                  "dust_fraction", "dust_pixels", "total_pixels", "dust_intensity",
-                  "pac", "pre"]
+                  "pac", "pre", "iod",
+                  "dust_pixels", "total_pixels"]
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -2188,9 +2189,9 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         try:
             with open(master_csv, "r", newline="") as f_master:
                 first_line = f_master.readline()
-            if "pac" not in first_line:
-                print("[warning] Existing master_dust_results.csv is missing v0.7.0 columns (pac, pre). "
-                      "Consider deleting or archiving it so a new file with the updated header can be created.")
+            if "iod" not in first_line:
+                print("[warning] Existing master_dust_results.csv uses an older schema. "
+                      "Consider deleting or archiving it so a new file with the v0.7.5 header can be created.")
         except Exception as e:
             print(f"[warning] Could not inspect master_dust_results.csv header: {e}")
             
