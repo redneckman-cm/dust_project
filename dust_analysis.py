@@ -1,11 +1,29 @@
 import os
 import cv2
 import csv
+import math
 import shutil
 import numpy as np
 from datetime import datetime
 import matplotlib.pyplot as plt
 import re
+from pathlib import Path
+
+try:
+    from weasyprint import HTML as WeasyHTML
+    HAS_WEASYPRINT = True
+except ImportError:
+    import subprocess, sys
+    print("[info] weasyprint not found – installing now...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "weasyprint"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        from weasyprint import HTML as WeasyHTML
+        HAS_WEASYPRINT = True
+        print("[info] weasyprint installed successfully.")
+    except Exception as _wp_err:
+        HAS_WEASYPRINT = False
+        print(f"[warning] weasyprint could not be installed – PDF export will be skipped. ({_wp_err})")
 
 # NEW: optional NEF support
 try:
@@ -26,7 +44,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.6.3"  # IOD (Integrated Optical Density) metric replaces binary thresholding
+TOOL_VERSION = "0.7.2"  # P90 percentile baseline, blank calibration, PAC + PRE metrics
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -50,6 +68,11 @@ DUST_PERCENTILE = 92.0      # higher -> fewer pixels marked as dust
 BASELINE_SIGMA_K = 0.25        # smaller K => more sensitive to darker-than-baseline pixels
 BASELINE_MIN_ABS_DELTA = 0.4   # allow moderately darker specks/shadows to count as dust
 BASELINE_LOCAL_PERCENTILE = 85.0  # slightly lower so more local-contrast specks qualify
+
+# Minimum baseline standard deviation (gray levels, 0-255 scale).
+# If the surface is very uniform the measured std can be so small that
+# 3*std catches salt-and-pepper sensor noise.  This floor prevents that.
+BASELINE_MIN_STD = 1.5
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".nef")
 
@@ -1078,9 +1101,11 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
       4. mean_opacity = sum(opacity) / total_roi_pixels
 
     Returns:
-      metric, dust_pixels, total_pixels, dust_binary, dust_score
-      metric     = dust_fraction (no-baseline mode) or mean_opacity (IOD mode)
-      dust_score = per-pixel float32 opacity map (used for red heatmap visualization)
+      metric, dust_pixels, total_pixels, dust_binary, dust_score, pac, pac_dust_pixels
+      metric         = dust_fraction (no-baseline mode) or mean_opacity (IOD mode)
+      dust_score     = per-pixel float32 opacity map (used for red heatmap visualization)
+      pac            = Percent Area Coverage (baseline mode only; 0.0 in no-baseline mode)
+      pac_dust_pixels = count of pixels classified as dust by the 3-sigma PAC threshold
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     roi = (mask_roi == 255)
@@ -1113,7 +1138,7 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         dust_score[dust_score < 0] = 0
         dust_score[~roi] = 0
 
-        return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score
+        return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score, 0.0, 0
     else:
         # IOD (Integrated Optical Density) approach.
         # Measures both the area and the density of dust in a single metric, which
@@ -1154,7 +1179,17 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         # dust_score: per-pixel opacity map fed to the red heatmap renderer.
         dust_score = opacity
 
-        return mean_opacity, dust_pixels, total_pixels, dust_binary, dust_score
+        # PAC (Percent Area Coverage): strict binary dust classification.
+        # A pixel is dust if its grayscale value falls more than 3 sigma below the
+        # baseline mean.  This is the analytical-chemistry 3-sigma detection-limit
+        # convention, applied as a validated threshold consistent with ISO 13322-1's
+        # requirement for threshold-based segmentation.
+        dust_threshold = base_mean - (3.0 * base_std)
+        is_dust = (gray_f < dust_threshold) & roi
+        pac_dust_pixels = int(np.count_nonzero(is_dust))
+        pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
+
+        return mean_opacity, dust_pixels, total_pixels, dust_binary, dust_score, pac, pac_dust_pixels
 
 # =========================
 # BASELINE DARK THRESHOLD CALIBRATION
@@ -1163,7 +1198,7 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 def compute_baseline_dark_threshold(baseline_image_bgr, baseline_mask, baseline_stats, percentile=98.5):
     """Derive a fixed darkness threshold from the untreated baseline image.
 
-    Uses the same simple delta = base_mean - gray as measure_dust (no shading
+    Uses the same simple delta = base_P90 - gray as measure_dust (no shading
     correction blur).  The 95th-percentile of the positive-delta distribution
     inside the baseline ROI sits close to actual background noise, giving a
     sensitive threshold.  Any sample pixel darker than this threshold is dust.
@@ -1201,21 +1236,66 @@ def compute_baseline_dark_threshold(baseline_image_bgr, baseline_mask, baseline_
     dark_thresh = max(min(raw_thresh, abs_thresh), 0.1)
 
     return float(dark_thresh)
+
+
+def compute_pre(results_list):
+    """Compute Particle Removal Efficiency for each image in the series.
+
+    PRE is relative to the FIRST image (dirty baseline, index 0).
+    PRE = (1 - PAC_current / PAC_baseline) * 100
+
+    First image always has PRE = 0.0%.  If PAC_baseline is 0, PRE is NaN
+    (no dust detected in the reference image, so removal ratio is undefined).
+
+    This metric follows the Rotational Force Test (RFT) methodology
+    (Ilse et al., 2020, JRSE 12(4):043503).
+    """
+    if not results_list:
+        return []
+    pac_baseline = results_list[0].get('pac', 0.0)
+    pre_values = []
+    for r in results_list:
+        pac_current = r.get('pac', 0.0)
+        if pac_baseline > 0:
+            pre = (1.0 - pac_current / pac_baseline) * 100.0
+        else:
+            pre = float('nan')
+        pre_values.append(pre)
+    return pre_values
+
+
 # =========================
 # IMAGE PROCESSING
 # =========================
 
 # Helper: Let user pick a baseline region in the untreated sample
-def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (untreated sample)", patch_radius=10):
+def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (untreated sample)", patch_radius=10, use_full_roi=False):
     """
     Let the user click on one or more CLEAN regions of the UNTREATED sample to define
-    a baseline grayscale mean and std inside the ROI. All selected patches are pooled
-    together to compute (mean, std).
+    a baseline reference intensity and std inside the ROI.  All selected patches are
+    pooled together.  The baseline intensity is the 90th percentile (P90) of the pooled
+    pixels -- this sits at the bright end of natural surface texture so that dark pits
+    from rugosity fall within the sigma guardband rather than being flagged as dust.
+    The std is clamped to a minimum of BASELINE_MIN_STD to reject sensor noise on
+    very uniform surfaces.
+
+    When use_full_roi=True, skips interactive selection and uses ALL ROI pixels.
+    This is the preferred mode when a separate blank (pre-dust) reference image is
+    available — it provides ~300K pixels instead of ~500 from manual patch clicks.
 
     Returns:
-      (baseline_mean, baseline_std)
+      (baseline_p90, baseline_std)
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    if use_full_roi:
+        roi_pixels = gray[mask_roi == 255]
+        if roi_pixels.size == 0:
+            raise RuntimeError("ROI has zero pixels in blank reference image.")
+        baseline_mean = float(np.percentile(roi_pixels, 90))
+        baseline_std = max(float(np.std(roi_pixels)), BASELINE_MIN_STD)
+        print(f"  Full-ROI blank calibration: {roi_pixels.size} pixels, P90={baseline_mean:.2f}, std={baseline_std:.2f}")
+        return baseline_mean, baseline_std
     h, w = gray.shape
 
     # Scale instruction font size with image size (larger text)
@@ -1438,8 +1518,8 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             # If all patches ended up empty, fallback to full ROI
             roi_pixels = gray[mask_roi == 255]
 
-    baseline_mean = float(np.mean(roi_pixels))
-    baseline_std = float(np.std(roi_pixels))
+    baseline_mean = float(np.percentile(roi_pixels, 90))
+    baseline_std = max(float(np.std(roi_pixels)), BASELINE_MIN_STD)
 
     return baseline_mean, baseline_std
 
@@ -1571,7 +1651,7 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
         circle = precomputed_roi_params
     else:
         mask_roi, circle = find_roi_from_grid(image)
-    dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score = measure_dust(
+    dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score, pac, pac_dust_pixels = measure_dust(
         image,
         mask_roi,
         baseline_stats=baseline_stats,
@@ -1646,40 +1726,79 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
         "dust_pixels": dust_pixels,
         "total_pixels": total_pixels,
         "dust_intensity": dust_intensity,
+        "pac": pac,                       # Percent Area Coverage (%)
+        "pac_dust_pixels": pac_dust_pixels,
     }
+
+# =========================
+# PDF EXPORT
+# =========================
+
+def html_to_pdf(html_path):
+    """Convert HTML file to PDF in the same directory."""
+    if not HAS_WEASYPRINT:
+        print("  PDF:   skipped (weasyprint not installed)")
+        return None
+    html_file = Path(html_path)
+    pdf_file = html_file.with_suffix('.pdf')
+    try:
+        WeasyHTML(filename=str(html_file)).write_pdf(str(pdf_file))
+        print(f"  PDF:   {pdf_file.name}")
+        return str(pdf_file)
+    except Exception as e:
+        print(f"  PDF:   conversion failed – {e}")
+        return None
 
 # =========================
 # PLOT + HTML REPORT
 # =========================
 
 def make_sample_plot(sample_dir, sample_name, results):
-    """Create dust vs image index plot with fixed y-scale (0–100%).
+    """Create dust vs image index plot with dual y-axes.
 
-    Two curves are shown:
-      - Coverage area (% of ROI pixels flagged as dust)
-      - Intensity (normalized integrated darkness, scaled to 0–100)
+    Left y-axis (0–100%): IOD mean opacity, intensity, and PAC — all represent
+    "how much dust is present" and trend downward.
+
+    Right y-axis (0–100%): PRE (Particle Removal Efficiency) — represents
+    "how much dust has been removed" and trends upward.
     """
     xs = [i + 1 for i in range(len(results))]
     coverage = [r["dust_fraction"] * 100.0 for r in results]
     intensity = [r.get("dust_intensity", 0.0) * 100.0 for r in results]
+    pac = [r.get("pac", 0.0) for r in results]
+    pre = [r.get("pre", 0.0) for r in results]
 
-    plt.figure()
-    plt.plot(xs, coverage, marker="o", label="Mean Opacity / IOD (%)")
-    plt.plot(xs, intensity, marker="s", linestyle="--", label="Intensity (normalized)")
-    plt.xlabel("Spin step (image index)")
-    plt.ylabel("Dust metric (%)")
+    fig, ax1 = plt.subplots()
+
+    # Left y-axis: dust-presence metrics
+    l1 = ax1.plot(xs, coverage, marker="o", color="tab:blue", label="Mean Opacity / IOD (%)")
+    l2 = ax1.plot(xs, intensity, marker="s", linestyle="--", color="tab:orange", label="Intensity (normalized)")
+    l3 = ax1.plot(xs, pac, marker="^", linestyle="-.", color="tab:red", label="PAC (%)")
+    ax1.set_xlabel("Spin step (image index)")
+    ax1.set_ylabel("Dust metric (%)")
+    ax1.set_ylim(0, 100)
+    ax1.grid(True)
+
+    # Right y-axis: removal efficiency
+    ax2 = ax1.twinx()
+    l4 = ax2.plot(xs, pre, marker="D", linestyle="--", color="tab:green", label="PRE (%)")
+    ax2.set_ylabel("Removal Efficiency (%)")
+    ax2.set_ylim(0, 100)
+
+    # Combined legend
+    lines = l1 + l2 + l3 + l4
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc="best")
+
     plt.title(f"Dust vs Spin Step – {sample_name}")
-    plt.ylim(0, 100)  # fixed scale for comparison
-    plt.grid(True)
-    plt.legend()
 
     plot_path = os.path.join(sample_dir, f"dust_plot_{sample_name}.png")
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     return plot_path
 
 
-def generate_sample_report(sample_dir, sample_name, results, moved_images):
+def generate_sample_report(sample_dir, sample_name, results, moved_images, blank_calibration=False):
     """
     Create an HTML report in sample_dir that includes:
       - Dust vs spin-speed plot
@@ -1718,8 +1837,13 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images):
         step = name_to_step.get(img_name, "")
         dust_pct = r["dust_fraction"] * 100.0
         dust_intensity = r.get("dust_intensity", 0.0) * 100.0
+        pac_val = r.get("pac", 0.0)
+        pre_val = r.get("pre", 0.0)
+        pre_str = f"{pre_val:.2f}%" if not math.isnan(pre_val) else "N/A"
         table_rows.append(
-            f"<tr><td>{img_name}</td><td>{step}</td><td>{dust_pct:.2f}%</td><td>{dust_intensity:.2f}%</td></tr>"
+            f"<tr><td>{img_name}</td><td>{step}</td>"
+            f"<td>{dust_pct:.2f}%</td><td>{dust_intensity:.2f}%</td>"
+            f"<td>{pac_val:.2f}%</td><td>{pre_str}</td></tr>"
         )
     table_html = "\n".join(table_rows)
 
@@ -1770,6 +1894,12 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images):
 </head>
 <body>
   <h1>Dust Report – {sample_name}</h1>
+  <p style="color:#555; font-size:0.9em;">
+    Tool version {TOOL_VERSION}.
+    Baseline calibrated to the 90th percentile (P90) of clean reference intensity
+    (accounts for surface rugosity). Dust threshold = P90 baseline &minus; 3&sigma;.
+    {"Full-ROI blank reference calibration." if blank_calibration else "Manual patch calibration."}
+  </p>
 
   <h2>Dust vs Spin Step</h2>
   {plot_html}
@@ -1782,6 +1912,8 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images):
         <th>Spin speed (step)</th>
         <th>Mean Opacity / IOD (%)</th>
         <th>Intensity (normalized %)</th>
+        <th>PAC (%)</th>
+        <th>PRE (%)</th>
       </tr>
     </thead>
     <tbody>
@@ -1807,10 +1939,14 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images):
 # FOLDER PROCESSING
 # =========================
 
-def process_folder(folder, sample_name, debug_first=False, baseline_from_last=False, run_timestamp=None):
+def process_folder(folder, sample_name, debug_first=False, baseline_from_last=False, run_timestamp=None, blank_calibration=False):
     """
     Process all images in the given folder as one sample.
     Saves everything into results/<sample_name>/ and returns results list.
+
+    When blank_calibration=True, the first image is treated as a clean blank
+    reference: its full ROI is used for baseline stats and it is excluded from
+    the measurement series.
     """
     folder = os.path.abspath(folder)
 
@@ -1864,9 +2000,14 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     base_roi_x0, base_roi_y0 = cur_roi_x0, cur_roi_y0
     apply_roi_to_all = False   # set True when user presses 'a' in nudge window
 
-    # Let user interactively select a clean reference region on the untreated sample
-    baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
-    print(f"Baseline stats (gray mean, std): {baseline_stats[0]:.2f}, {baseline_stats[1]:.2f}")
+    # Baseline calibration: full-ROI when blank image, manual patches otherwise
+    if blank_calibration:
+        baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask, use_full_roi=True)
+        print("Blank reference image used for full-ROI calibration (excluded from measurements).")
+    else:
+        # Let user interactively select a clean reference region on the untreated sample
+        baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
+    print(f"Baseline stats (P90, std): {baseline_stats[0]:.2f}, {baseline_stats[1]:.2f}")
 
     # IOD mode: noise floor is always 3 × base_std, computed inside measure_dust.
     # No separate threshold calibration step needed.
@@ -1886,7 +2027,19 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     processed_dir = os.path.join(folder, 'processed_images')
     os.makedirs(processed_dir, exist_ok=True)
 
-    for i, fname in enumerate(images):
+    # When using a separate blank reference, archive it and exclude from measurements
+    if blank_calibration and not baseline_from_last:
+        blank_fname = images[0]
+        blank_src = os.path.join(folder, blank_fname)
+        shutil.copy2(blank_src, os.path.join(processed_dir, blank_fname))
+        blank_dest = os.path.join(sample_dir, blank_fname)
+        shutil.move(blank_src, blank_dest)
+        print(f"  Blank reference '{blank_fname}' archived (not measured).")
+        measure_images = images[1:]
+    else:
+        measure_images = images
+
+    for i, fname in enumerate(measure_images):
         src_path = os.path.join(folder, fname)
         print(f"Processing {fname}...")
 
@@ -1941,6 +2094,11 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         shutil.move(src_path, dest_path)
         moved_images.append(dest_path)
 
+    # Compute PRE (Particle Removal Efficiency) relative to the first image.
+    pre_values = compute_pre(results)
+    for r, pre in zip(results, pre_values):
+        r['pre'] = pre
+
     # Build rows with sample + spin_step
     rows = []
     for i, r in enumerate(results):
@@ -1953,12 +2111,15 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             "dust_pixels": r["dust_pixels"],
             "total_pixels": r["total_pixels"],
             "dust_intensity": r.get("dust_intensity", 0.0),
+            "pac": r.get("pac", 0.0),
+            "pre": r.get("pre", 0.0),
         })
 
     # --- Per-sample CSV ---
     csv_path = os.path.join(sample_dir, f"dust_results_{sample_name}.csv")
     fieldnames = ["sample", "spin_step", "image",
-                  "dust_fraction", "dust_pixels", "total_pixels", "dust_intensity"]
+                  "dust_fraction", "dust_pixels", "total_pixels", "dust_intensity",
+                  "pac", "pre"]
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1973,8 +2134,8 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         try:
             with open(master_csv, "r", newline="") as f_master:
                 first_line = f_master.readline()
-            if "dust_intensity" not in first_line:
-                print("[warning] Existing master_dust_results.csv has no 'dust_intensity' column. "
+            if "pac" not in first_line:
+                print("[warning] Existing master_dust_results.csv is missing v0.7.0 columns (pac, pre). "
                       "Consider deleting or archiving it so a new file with the updated header can be created.")
         except Exception as e:
             print(f"[warning] Could not inspect master_dust_results.csv header: {e}")
@@ -1986,7 +2147,11 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         writer.writerows(rows)
 
     # Generate HTML report (unchanged, still uses original results)
-    report_path = generate_sample_report(sample_dir, sample_name, results, moved_images)
+    report_path = generate_sample_report(sample_dir, sample_name, results, moved_images,
+                                         blank_calibration=blank_calibration)
+
+    # Convert HTML report to PDF
+    html_to_pdf(report_path)
 
     print(f"\nAll outputs saved in: {sample_dir}")
     print(f"  CSV:   {os.path.basename(csv_path)}")
@@ -2055,39 +2220,51 @@ if __name__ == "__main__":
         sample_name = default_sample_name
 
     # Decide how to select baseline image:
-    #   Yes  -> first image in sample_images is separate untreated baseline
+    #   Yes  -> first image is a clean blank reference (full-ROI calibration, excluded from measurements)
     #   No   -> use last image in series as baseline region (no separate baseline file)
     baseline_from_last = False
+    blank_calibration = False
 
     if TK_AVAILABLE:
         try:
             root2 = tk.Tk()
             root2.withdraw()
             baseline_msg = (
-                "Is there a separate UNTREATED baseline image in the 'sample_images' folder?\n\n"
-                "Yes = use the FIRST image in the series as the untreated baseline.\n"
-                "No  = use the LAST image in the series and select a clean region on it as baseline."
+                "Is the FIRST image a clean BLANK reference (captured before dust)?\n\n"
+                "Yes = use full ROI of first image for calibration.\n"
+                "        It will be EXCLUDED from measurements.\n\n"
+                "No  = no separate blank. Use the LAST image and\n"
+                "        select clean patches manually."
             )
             has_separate_baseline = messagebox.askyesno(
                 "Baseline Image",
                 baseline_msg,
                 parent=root2,
             )
-            baseline_from_last = not has_separate_baseline
+            if has_separate_baseline:
+                baseline_from_last = False
+                blank_calibration = True
+            else:
+                baseline_from_last = True
+                blank_calibration = False
             root2.destroy()
         except Exception as e:
             print(f"[warning] Tkinter baseline prompt failed: {e}")
-            print("          Defaulting to using FIRST image as baseline.")
+            print("          Defaulting to using FIRST image as blank calibration.")
             baseline_from_last = False
+            blank_calibration = True
     else:
-        # No Tkinter available – default to first image as baseline
+        # No Tkinter available – default to first image as blank calibration
         baseline_from_last = False
+        blank_calibration = True
 
     print("\nRunning analysis in batch mode...")
     print(f"  Folder: {folder}")
     print(f"  Sample: {sample_name}")
+    print(f"  Blank calibration: {blank_calibration}")
     print("  (Drop images into sample_images and run the launcher.)\n")
 
-    process_folder(folder, sample_name, debug_first=False, baseline_from_last=baseline_from_last, run_timestamp=timestamp)
+    process_folder(folder, sample_name, debug_first=False, baseline_from_last=baseline_from_last,
+                   run_timestamp=timestamp, blank_calibration=blank_calibration)
 
     print("\nDone. You can close this window.")
