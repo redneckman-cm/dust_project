@@ -9,21 +9,57 @@ import matplotlib.pyplot as plt
 import re
 from pathlib import Path
 
+def _load_weasyprint():
+    """Try to import WeasyPrint; auto-install native deps if needed."""
+    import warnings as _warnings
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        from weasyprint import HTML as _HTML
+    return _HTML
+
 try:
-    from weasyprint import HTML as WeasyHTML
+    WeasyHTML = _load_weasyprint()
     HAS_WEASYPRINT = True
-except ImportError:
-    import subprocess, sys
-    print("[info] weasyprint not found – installing now...")
+except Exception:
+    import subprocess as _sp, platform as _pl, os as _os_mod, sys as _sys
+    WeasyHTML = None
+    _installed = False
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "weasyprint"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        from weasyprint import HTML as WeasyHTML
-        HAS_WEASYPRINT = True
-        print("[info] weasyprint installed successfully.")
-    except Exception as _wp_err:
+        if _pl.system() == 'Darwin':
+            if _sp.run(['which', 'brew'], capture_output=True).returncode == 0:
+                print("[info] Installing WeasyPrint native dependencies via Homebrew (pango)...")
+                _sp.check_call(['brew', 'install', 'pango'],
+                               stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                _prefix = _sp.check_output(['brew', '--prefix'], text=True).strip()
+                _lib = _os_mod.path.join(_prefix, 'lib')
+                _cur = _os_mod.environ.get('DYLD_FALLBACK_LIBRARY_PATH', '')
+                _os_mod.environ['DYLD_FALLBACK_LIBRARY_PATH'] = f"{_lib}:{_cur}" if _cur else _lib
+                _installed = True
+            else:
+                print("[warning] Homebrew not found — cannot auto-install WeasyPrint deps.\n"
+                      "          Install from https://brew.sh then run: brew install pango")
+        elif _pl.system() == 'Linux':
+            print("[info] Installing WeasyPrint native dependencies via apt-get...")
+            _sp.check_call(['apt-get', 'install', '-y',
+                            'libpango-1.0-0', 'libpangoft2-1.0-0',
+                            'libpangocairo-1.0-0', 'libcairo2'],
+                           stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            _installed = True
+    except Exception as _e:
+        print(f"[warning] Could not install WeasyPrint native dependencies: {_e}")
+    if _installed:
+        for _mod in list(_sys.modules.keys()):
+            if 'weasyprint' in _mod:
+                del _sys.modules[_mod]
+        try:
+            WeasyHTML = _load_weasyprint()
+            HAS_WEASYPRINT = True
+            print("[info] WeasyPrint ready — PDF export enabled.")
+        except Exception as _e2:
+            HAS_WEASYPRINT = False
+            print(f"[warning] WeasyPrint unavailable after install — PDF export skipped. ({_e2})")
+    else:
         HAS_WEASYPRINT = False
-        print(f"[warning] weasyprint could not be installed – PDF export will be skipped. ({_wp_err})")
 
 # NEW: optional NEF support
 try:
