@@ -117,7 +117,7 @@ BASELINE_MIN_STD = 1.5
 # matches what is visually resolvable — sub-visual thin layers are real
 # but should not dominate the area metric.
 IOD_SIGMA = 3.0
-PAC_SIGMA = 4.0
+PAC_SIGMA = 5.0
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".nef")
 
@@ -1722,12 +1722,12 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
         if roi_vals.size > 0:
             dust_intensity = float(roi_vals.mean())
 
-    # Create highlight image (gray background + gradient red overlay based on dust darkness)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Light denoise just for visualization so the background looks less grainy.
-    # Dust detection itself still uses the original image via dust_binary/dust_score.
-    gray_smooth = cv2.fastNlMeansDenoising(gray, None, h=3, templateWindowSize=7, searchWindowSize=21)
-    base_bgr = cv2.cvtColor(gray_smooth, cv2.COLOR_GRAY2BGR)
+    # Create highlight image (colour background + gradient red overlay based on dust score).
+    # Keeping the original colour preserves substrate hue (e.g. orange disc) so the
+    # heatmap can be directly compared against the eye test.  Light colour denoise
+    # for visual quality only — dust detection uses the original image unchanged.
+    base_bgr = cv2.fastNlMeansDenoisingColored(image, None, h=3, hColor=3,
+                                               templateWindowSize=7, searchWindowSize=21)
 
     # Use the continuous darkness score for visualization.
     dust_score_f = dust_score.astype(np.float32)
