@@ -1130,11 +1130,14 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
     When baseline_stats is None: local-contrast percentile method (no baseline image).
 
-    When baseline_stats is provided: IOD (Integrated Optical Density) method.
-      1. delta = base_mean - gray_pixel  (positive = darker than baseline)
-      2. 3-sigma noise floor: delta = 0 where delta < 3 * base_std
-      3. opacity = delta / base_mean  (clamped to [0, 1])
-      4. mean_opacity = sum(opacity) / total_roi_pixels
+    When baseline_stats is provided: LAB b*-channel IOD method.
+      baseline_stats holds (mean_b*, std_b*) from the clean reference image.
+      b* (Yellow-Blue axis) isolates the colour-shift caused by achromatic dust
+      on a yellow substrate; illumination flicker changes L* but not b*.
+      1. delta = base_b*_mean - pixel_b*  (positive = less yellow than baseline)
+      2. 3-sigma noise floor: delta = 0 where delta < 3 * base_b*_std
+      3. colour_shift = delta / base_b*_mean  (clamped to [0, 1])
+      4. mean_colour_shift = sum(colour_shift) / total_roi_pixels
 
     Returns:
       metric, dust_pixels, total_pixels, dust_binary, dust_score, pac, pac_dust_pixels
@@ -1176,52 +1179,51 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
         return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score, 0.0, 0
     else:
-        # IOD (Integrated Optical Density) approach.
-        # Measures both the area and the density of dust in a single metric, which
-        # correlates directly to dust mass remaining on the surface.  Scientifically
-        # defensible: mean_opacity = 0.0 for a clean image, 1.0 for fully opaque.
+        # LAB b*-channel IOD approach.
+        # b* (Yellow-Blue axis) isolates the colour-shift caused by achromatic
+        # (neutral grey) lunar simulant on a yellow substrate.  Illumination flicker
+        # changes L* (lightness) but not b*, making this metric robust to lighting
+        # variation while remaining sensitive to dust-driven colour loss.
+        # baseline_stats = (mean_b*, std_b*) from the clean reference.
         base_mean, base_std = baseline_stats
 
         if base_std < 1e-3:
             base_std = 1.0
 
-        gray_f = gray.astype(np.float32)
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        b_f = lab[:, :, 2].astype(np.float32) - 128.0  # real b*: -128 to +127
 
-        # Step 1: Per-pixel delta — positive where pixel is darker than baseline mean.
-        delta = (base_mean - gray_f).astype(np.float32)
+        # Step 1: Per-pixel b* drop — positive where pixel is less yellow than baseline.
+        delta = (base_mean - b_f).astype(np.float32)
 
-        # Step 2: 3-sigma noise floor (standard signal/noise criterion).
-        # Zero out any pixel whose darkening falls within normal baseline variation.
+        # Step 2: 3-sigma noise floor — suppress sensor noise and minor colour drift.
         noise_floor = 3.0 * base_std
         delta[delta < noise_floor] = 0.0
         delta[~roi] = 0.0
 
-        # Step 3: Normalize by baseline mean → per-pixel Opacity Score in [0, 1].
-        # 0.0 = same brightness as baseline (clean); 1.0 = totally opaque (black).
-        if base_mean > 0:
+        # Step 3: Normalise by baseline b* mean → per-pixel Colour-Shift Score in [0,1].
+        # 0.0 = same yellowness as baseline (clean); 1.0 = full loss of yellowness.
+        if base_mean > 1e-3:
             opacity = np.clip(delta / base_mean, 0.0, 1.0).astype(np.float32)
         else:
             opacity = np.zeros_like(delta, dtype=np.float32)
 
-        # Step 4: Mean Opacity across the entire ROI — the primary IOD metric.
+        # Step 4: Mean Colour-Shift across the entire ROI — the IOD analog.
         # Dividing by total_pixels (not nonzero count) correctly penalises sparse dust.
         mean_opacity = float(np.sum(opacity) / total_pixels)
 
         # dust_binary: pixels that cleared the noise floor (for visualization overlay).
-        dust_binary = np.zeros_like(gray, dtype=np.uint8)
+        dust_binary = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
         dust_binary[opacity > 0] = 255
         dust_pixels = np.count_nonzero(dust_binary == 255)
 
-        # dust_score: per-pixel opacity map fed to the red heatmap renderer.
+        # dust_score: per-pixel colour-shift map for the red heatmap renderer.
         dust_score = opacity
 
-        # PAC (Percent Area Coverage): strict binary dust classification.
-        # A pixel is dust if its grayscale value falls more than 3 sigma below the
-        # baseline mean.  This is the analytical-chemistry 3-sigma detection-limit
-        # convention, applied as a validated threshold consistent with ISO 13322-1's
-        # requirement for threshold-based segmentation.
+        # PAC (Percent Area Coverage): pixel is dust if b* drops more than 3 sigma
+        # below baseline — the standard analytical-chemistry 3-sigma detection limit.
         dust_threshold = base_mean - (3.0 * base_std)
-        is_dust = (gray_f < dust_threshold) & roi
+        is_dust = (b_f < dust_threshold) & roi
         pac_dust_pixels = int(np.count_nonzero(is_dust))
         pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
 
@@ -1308,31 +1310,36 @@ def compute_pre(results_list):
 def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (untreated sample)", patch_radius=10, use_full_roi=False):
     """
     Let the user click on one or more CLEAN regions of the UNTREATED sample to define
-    a baseline reference intensity and std inside the ROI.  All selected patches are
-    pooled together.  The baseline intensity is the 90th percentile (P90) of the pooled
-    pixels -- this sits at the bright end of natural surface texture so that dark pits
-    from rugosity fall within the sigma guardband rather than being flagged as dust.
-    The std is clamped to a minimum of BASELINE_MIN_STD to reject sensor noise on
-    very uniform surfaces.
+    a baseline reference in LAB b* colour space.  b* (Yellow-Blue axis) is used
+    instead of grayscale because surface rugosity affects brightness (L*) but not
+    colour (b*), so the mean b* of a clean yellow surface is stable regardless of
+    texture depth.  All selected patches are pooled together.
+
+    The std is clamped to BASELINE_MIN_STD to reject sensor noise on very uniform
+    surfaces.
 
     When use_full_roi=True, skips interactive selection and uses ALL ROI pixels.
     This is the preferred mode when a separate blank (pre-dust) reference image is
     available — it provides ~300K pixels instead of ~500 from manual patch clicks.
 
     Returns:
-      (baseline_p90, baseline_std)
+      (baseline_b*_mean, baseline_b*_std)
     """
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    # Use LAB b* (Yellow-Blue axis) for colour-aware baseline.
+    # b* is insensitive to illumination changes and surface rugosity,
+    # both of which affect L* (lightness) rather than b* (colour).
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    b_channel = lab[:, :, 2].astype(np.float32) - 128.0  # real b*: -128 to +127
 
     if use_full_roi:
-        roi_pixels = gray[mask_roi == 255]
+        roi_pixels = b_channel[mask_roi == 255]
         if roi_pixels.size == 0:
             raise RuntimeError("ROI has zero pixels in blank reference image.")
-        baseline_mean = float(np.percentile(roi_pixels, 90))
+        baseline_mean = float(np.mean(roi_pixels))
         baseline_std = max(float(np.std(roi_pixels)), BASELINE_MIN_STD)
-        print(f"  Full-ROI blank calibration: {roi_pixels.size} pixels, P90={baseline_mean:.2f}, std={baseline_std:.2f}")
+        print(f"  Full-ROI blank calibration (LAB b*): {roi_pixels.size} pixels, mean b*={baseline_mean:.2f}, std={baseline_std:.2f}")
         return baseline_mean, baseline_std
-    h, w = gray.shape
+    h, w = b_channel.shape
 
     # Scale instruction font size with image size (larger text)
     min_dim = min(h, w)
@@ -1528,10 +1535,10 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
     cv2.destroyWindow(window_name)
 
     if not baseline_points:
-        # Fallback: use entire ROI if no clicks were registered or user pressed 'q'
-        roi_pixels = gray[mask_roi == 255]
+        # Fallback: use entire ROI b* if no clicks were registered or user pressed 'q'
+        roi_pixels = b_channel[mask_roi == 255]
     else:
-        # Collect pixels from patches around ALL selected baseline points
+        # Collect b* pixels from patches around ALL selected baseline points
         collected = []
         for (x_f, y_f) in baseline_points:
             x = int(round(x_f))
@@ -1542,7 +1549,7 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             y0 = max(0, y - patch_radius)
             y1 = min(h, y + patch_radius + 1)
 
-            patch = gray[y0:y1, x0:x1]
+            patch = b_channel[y0:y1, x0:x1]
             patch_mask = mask_roi[y0:y1, x0:x1] == 255
             patch_pixels = patch[patch_mask]
             if patch_pixels.size > 0:
@@ -1552,9 +1559,9 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             roi_pixels = np.concatenate(collected, axis=0)
         else:
             # If all patches ended up empty, fallback to full ROI
-            roi_pixels = gray[mask_roi == 255]
+            roi_pixels = b_channel[mask_roi == 255]
 
-    baseline_mean = float(np.percentile(roi_pixels, 90))
+    baseline_mean = float(np.mean(roi_pixels))  # mean b* of clean surface
     baseline_std = max(float(np.std(roi_pixels)), BASELINE_MIN_STD)
 
     return baseline_mean, baseline_std
