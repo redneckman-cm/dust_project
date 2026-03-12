@@ -105,10 +105,19 @@ BASELINE_SIGMA_K = 0.25        # smaller K => more sensitive to darker-than-base
 BASELINE_MIN_ABS_DELTA = 0.4   # allow moderately darker specks/shadows to count as dust
 BASELINE_LOCAL_PERCENTILE = 85.0  # slightly lower so more local-contrast specks qualify
 
-# Minimum baseline standard deviation (gray levels, 0-255 scale).
+# Minimum baseline standard deviation (b* units, LAB colour space).
 # If the surface is very uniform the measured std can be so small that
-# 3*std catches salt-and-pepper sensor noise.  This floor prevents that.
+# the sigma threshold catches camera noise or minor WB drift.  This floor
+# ensures a meaningful minimum absolute b* drop is required for detection.
 BASELINE_MIN_STD = 1.5
+
+# Sigma multipliers for the two detection metrics.
+# IOD uses a sensitive 3-sigma floor to catch even fine dust layers.
+# PAC uses a stricter 4-sigma threshold so the binary area count better
+# matches what is visually resolvable — sub-visual thin layers are real
+# but should not dominate the area metric.
+IOD_SIGMA = 3.0
+PAC_SIGMA = 4.0
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".nef")
 
@@ -1196,8 +1205,9 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         # Step 1: Per-pixel b* drop — positive where pixel is less yellow than baseline.
         delta = (base_mean - b_f).astype(np.float32)
 
-        # Step 2: 3-sigma noise floor — suppress sensor noise and minor colour drift.
-        noise_floor = 3.0 * base_std
+        # Step 2: IOD_SIGMA noise floor — suppress sensor noise and minor colour drift.
+        # IOD_SIGMA = 3.0 keeps IOD sensitive to even fine/thin dust layers.
+        noise_floor = IOD_SIGMA * base_std
         delta[delta < noise_floor] = 0.0
         delta[~roi] = 0.0
 
@@ -1220,9 +1230,10 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         # dust_score: per-pixel colour-shift map for the red heatmap renderer.
         dust_score = opacity
 
-        # PAC (Percent Area Coverage): pixel is dust if b* drops more than 3 sigma
-        # below baseline — the standard analytical-chemistry 3-sigma detection limit.
-        dust_threshold = base_mean - (3.0 * base_std)
+        # PAC (Percent Area Coverage): stricter PAC_SIGMA threshold so the binary
+        # area count better matches visually resolvable dust.  Sub-visual thin layers
+        # still show in IOD but don't inflate the area percentage.
+        dust_threshold = base_mean - (PAC_SIGMA * base_std)
         is_dust = (b_f < dust_threshold) & roi
         pac_dust_pixels = int(np.count_nonzero(is_dust))
         pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
