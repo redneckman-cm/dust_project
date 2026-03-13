@@ -80,7 +80,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.7.6"  # Auto-detect substrate colour → b* (coloured) or L* (clear/grey)
+TOOL_VERSION = "0.7.7"  # Channel-dependent BASELINE_MIN_STD floor for L* detection
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -105,11 +105,15 @@ BASELINE_SIGMA_K = 0.25        # smaller K => more sensitive to darker-than-base
 BASELINE_MIN_ABS_DELTA = 0.4   # allow moderately darker specks/shadows to count as dust
 BASELINE_LOCAL_PERCENTILE = 85.0  # slightly lower so more local-contrast specks qualify
 
-# Minimum baseline standard deviation (b* units, LAB colour space).
+# Minimum baseline standard deviation (LAB colour space).
 # If the surface is very uniform the measured std can be so small that
 # the sigma threshold catches camera noise or minor WB drift.  This floor
-# ensures a meaningful minimum absolute b* drop is required for detection.
-BASELINE_MIN_STD = 1.5
+# ensures a meaningful minimum absolute channel drop is required for detection.
+# b* (coloured substrates) has a narrow range (~30-50), so 1.5 is appropriate.
+# L* (clear/grey substrates) has a much wider range (~170-220), so a larger
+# floor is needed to avoid flagging everything as dust.
+BASELINE_MIN_STD = 1.5       # floor for b* channel
+BASELINE_MIN_STD_LSTAR = 5.0 # floor for L* channel
 
 # Sigma multipliers for the two detection metrics.
 # IOD uses a sensitive 3-sigma floor to catch even fine dust layers.
@@ -1359,7 +1363,8 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             channel = "L*"
             roi_pixels = l_channel[mask_roi == 255]
         baseline_mean = float(np.mean(roi_pixels))
-        baseline_std = max(float(np.std(roi_pixels)), BASELINE_MIN_STD)
+        std_floor = BASELINE_MIN_STD if channel == "b*" else BASELINE_MIN_STD_LSTAR
+        baseline_std = max(float(np.std(roi_pixels)), std_floor)
         print(f"  Auto-detected substrate → {channel} channel")
         print(f"  Full-ROI blank calibration (LAB {channel}): {roi_pixels.size} pixels, mean {channel}={baseline_mean:.2f}, std={baseline_std:.2f}")
         return baseline_mean, baseline_std, channel
@@ -1604,7 +1609,8 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             roi_pixels = np.concatenate(collected_l, axis=0) if collected_l else l_channel[mask_roi == 255]
 
     baseline_mean = float(np.mean(roi_pixels))
-    baseline_std = max(float(np.std(roi_pixels)), BASELINE_MIN_STD)
+    std_floor = BASELINE_MIN_STD if channel == "b*" else BASELINE_MIN_STD_LSTAR
+    baseline_std = max(float(np.std(roi_pixels)), std_floor)
     print(f"  Auto-detected substrate → {channel} channel (mean b*={mean_b:.1f})")
 
     return baseline_mean, baseline_std, channel
