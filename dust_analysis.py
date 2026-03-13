@@ -80,7 +80,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.8.0"  # Per-pixel image subtraction — substrate-agnostic detection
+TOOL_VERSION = "0.8.1"  # Auto-alignment + brightness normalization for subtraction mode
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -127,6 +127,16 @@ PAC_SIGMA = 5.0
 
 # Legacy auto-detection threshold (v0.7.x, kept for reference):
 # B_STAR_THRESHOLD = 10.0  # was: if |mean b*| > threshold → coloured, else clear
+
+# Percentile for global brightness normalisation between calibration and
+# dusted images.  The high percentile selects the "brightest" (least dusty)
+# pixels as the reference for computing the illumination offset.
+# 95th percentile is robust even when up to ~90 % of the ROI is dusty.
+BRIGHTNESS_NORM_PERCENTILE = 95.0
+
+# Minimum normalised cross-correlation score for template-matching alignment.
+# Below this, the alignment may be unreliable and a warning is printed.
+ALIGN_MIN_CONFIDENCE = 0.5
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".nef")
 
@@ -1001,7 +1011,67 @@ def rect_to_roi(x0, y0, x1, y1, img_h, img_w):
 
 
 # =========================
-# PER-IMAGE ROI NUDGE
+# AUTO-ALIGNMENT (TEMPLATE MATCHING)
+# =========================
+
+def auto_align_to_baseline(baseline_gray, dusted_gray,
+                           roi_x0, roi_y0, roi_x1, roi_y1):
+    """
+    Find the (dx, dy) pixel offset between baseline and dusted image
+    using template matching on the ROI region + surrounding context
+    (grid lines, disc edge, tape edges).
+
+    Parameters:
+      baseline_gray : 2D uint8 grayscale of the rotated baseline image
+      dusted_gray   : 2D uint8 grayscale of the rotated dusted image
+      roi_x0..roi_y1: ROI rectangle in the baseline image coordinate system
+
+    Returns:
+      (dx, dy, confidence)
+      dx, dy      : integer pixel offset (dusted = baseline + offset)
+      confidence  : 0–1 normalised cross-correlation score
+    """
+    h, w = baseline_gray.shape
+
+    # Template: ROI + 50 % padding to capture surrounding context
+    roi_w = roi_x1 - roi_x0
+    roi_h = roi_y1 - roi_y0
+    pad = max(50, roi_w // 2, roi_h // 2)
+    tmpl_x0 = max(0, roi_x0 - pad)
+    tmpl_y0 = max(0, roi_y0 - pad)
+    tmpl_x1 = min(w, roi_x1 + pad)
+    tmpl_y1 = min(h, roi_y1 + pad)
+    template = baseline_gray[tmpl_y0:tmpl_y1, tmpl_x0:tmpl_x1]
+
+    # Search area: template region ± 100 px (handles 50 + px camera shifts)
+    search_margin = 100
+    dh, dw = dusted_gray.shape
+    sx0 = max(0, tmpl_x0 - search_margin)
+    sy0 = max(0, tmpl_y0 - search_margin)
+    sx1 = min(dw, tmpl_x1 + search_margin)
+    sy1 = min(dh, tmpl_y1 + search_margin)
+    search_region = dusted_gray[sy0:sy1, sx0:sx1]
+
+    # Guard: search region must be larger than the template in both dimensions
+    if (search_region.shape[0] <= template.shape[0] or
+            search_region.shape[1] <= template.shape[1]):
+        # Cannot search — template is as large as the search area
+        return 0, 0, 0.0
+
+    result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+    # max_loc is the top-left of the best match within search_region
+    match_x = max_loc[0] + sx0   # convert back to full-image coords
+    match_y = max_loc[1] + sy0
+
+    dx = match_x - tmpl_x0
+    dy = match_y - tmpl_y0
+    return dx, dy, float(max_val)
+
+
+# =========================
+# PER-IMAGE ROI NUDGE (legacy, kept for reference)
 # =========================
 
 def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
@@ -1148,10 +1218,12 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
     When baseline_stats is None: local-contrast percentile method (no baseline image).
 
-    When baseline_stats is provided (v0.8.0+, image-subtraction mode):
+    When baseline_stats is provided (v0.8.1+, image-subtraction mode):
       Per-pixel subtraction of calibration L* from dusted L*.  The substrate
       cancels out, leaving only the dust signal.
-      1. delta = cal_L*[x,y] - dust_L*[x,y]   (positive = dust present)
+      0. Global brightness normalisation: align high-percentile L* to correct
+         for illumination drift between calibration and dusted shots.
+      1. delta = cal_L*[x,y] - dust_L*_corrected[x,y]   (positive = dust present)
       2. Noise floor: delta = 0 where delta < IOD_SIGMA * base_std
       3. opacity = delta / max(cal_L*[x,y], 10)   (clamped to [0, 1])
       4. IOD = mean(opacity) across the entire ROI
@@ -1222,10 +1294,27 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         crop_mask = mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] == 255
 
         if cal_roi_2d is not None and cal_roi_2d.shape == dust_roi_2d.shape:
-            # ===== Per-pixel image subtraction (v0.8.0) =====
+            # ===== Per-pixel image subtraction (v0.8.1) =====
+
+            # Step 0: Global brightness normalisation.
+            # Compute the high-percentile L* in both crops (using only ROI-masked
+            # pixels) to estimate the illumination offset.  The high percentile
+            # represents "clean surface" brightness — robust even when most
+            # pixels are covered in dust.
+            cal_masked = cal_roi_2d[crop_mask]
+            dust_masked = dust_roi_2d[crop_mask]
+            cal_pN = float(np.percentile(cal_masked, BRIGHTNESS_NORM_PERCENTILE))
+            dust_pN = float(np.percentile(dust_masked, BRIGHTNESS_NORM_PERCENTILE))
+            brightness_shift = cal_pN - dust_pN
+            dust_roi_corrected = dust_roi_2d + brightness_shift
+
+            if abs(brightness_shift) > 0.5:
+                print(f"    Brightness correction: {brightness_shift:+.1f} L* "
+                      f"(cal p{BRIGHTNESS_NORM_PERCENTILE:.0f}={cal_pN:.1f}, "
+                      f"dust p{BRIGHTNESS_NORM_PERCENTILE:.0f}={dust_pN:.1f})")
 
             # Step 1: Per-pixel difference — positive where cal is brighter (dust present)
-            delta_2d = (cal_roi_2d - dust_roi_2d).astype(np.float32)
+            delta_2d = (cal_roi_2d - dust_roi_corrected).astype(np.float32)
 
             # Step 2: IOD_SIGMA noise floor — suppress sensor noise
             noise_floor = IOD_SIGMA * base_std
@@ -1253,9 +1342,9 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
             # dust_score: per-pixel map for the red heatmap renderer
             dust_score = opacity
 
-            # PAC: stricter threshold on the raw difference image
+            # PAC: stricter threshold on the brightness-corrected difference
             pac_floor = PAC_SIGMA * base_std
-            raw_delta_2d = (cal_roi_2d - dust_roi_2d).astype(np.float32)
+            raw_delta_2d = (cal_roi_2d - dust_roi_corrected).astype(np.float32)
             is_dust_2d = (raw_delta_2d > pac_floor) & crop_mask
             pac_dust_pixels = int(np.count_nonzero(is_dust_2d))
             pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
@@ -1998,7 +2087,7 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images, blank
   <h1>Dust Report – {sample_name}</h1>
   <p style="color:#555; font-size:0.9em;">
     Tool version {TOOL_VERSION}. &nbsp;
-    <strong>Detection:</strong> Per-pixel image subtraction on LAB L* (lightness). The clean calibration image is subtracted from each dusted image, cancelling substrate colour and isolating the dust signal. &nbsp;
+    <strong>Detection:</strong> Per-pixel image subtraction on LAB L* (lightness) with auto-alignment (template matching) and brightness normalisation (p{BRIGHTNESS_NORM_PERCENTILE:.0f} alignment). The clean calibration image is subtracted from each dusted image after correcting for camera shift and illumination drift. &nbsp;
     <strong>Baseline:</strong> {"L* of full ROI from blank reference image (Step 0, not measured)." if blank_calibration else "L* from manually selected clean patches on the untreated sample."} &nbsp;
     <strong>IOD threshold:</strong> calibration L* &minus; dusted L* &gt; {IOD_SIGMA:.0f}&sigma; noise floor (continuous metric). &nbsp;
     <strong>PAC threshold:</strong> calibration L* &minus; dusted L* &gt; {PAC_SIGMA:.0f}&sigma; noise floor (binary area classification). &nbsp;
@@ -2093,15 +2182,16 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print("  baseline image.  Press 'r' to restart, Enter to confirm.")
     baseline_mask, roi_params = find_roi_user_guided(baseline_image)
     print(f"  ROI centre: ({roi_params[0]}, {roi_params[1]}), half-side: {roi_params[2]}px")
-    print("  ROI confirmed. A zoomed nudge window will appear for each image.")
-    print("  Use w/a/s/d to shift 10 px, z/x/,/. for ±1 px fine nudge.")
-    print("  Press 'y' to lock the current position for all remaining images.")
+    print("  ROI confirmed. Per-image alignment will be automatic (template matching).")
 
-    # Extract the ROI as a rectangle for per-image nudge.
-    # base_roi_* holds the original baseline position for offset reporting.
+    # Extract the ROI as a rectangle.
+    # base_roi_* holds the original baseline position for auto-alignment reference.
     cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1 = roi_to_rect(baseline_mask)
     base_roi_x0, base_roi_y0 = cur_roi_x0, cur_roi_y0
-    apply_roi_to_all = False   # set True when user presses 'a' in nudge window
+    base_roi_x1, base_roi_y1 = cur_roi_x1, cur_roi_y1
+
+    # Prepare grayscale baseline for template-matching alignment
+    baseline_gray = cv2.cvtColor(baseline_image, cv2.COLOR_BGR2GRAY)
 
     # Baseline calibration: full-ROI when blank image, manual patches otherwise
     if blank_calibration:
@@ -2158,27 +2248,29 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
 
         spin_step = i  # step 0 = first dusted image (no spin yet)
 
-        # Load + rotate for the ROI confirmation window.
-        # (process_single_image will reload the image independently for the
-        #  actual measurement; this load is only for the interactive preview.)
+        # Load + rotate for auto-alignment and measurement.
         preview = apply_rotation(load_image_any(src_path), rotation_angle)
         img_h, img_w = preview.shape[:2]
 
-        if not apply_roi_to_all:
-            # Show the image with the current ROI box; let user nudge if needed.
-            nx0, ny0, nx1, ny1, apply_roi_to_all = interactive_roi_nudge(
-                preview,
-                cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1,
-                image_name=fname,
-            )
-            cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1 = nx0, ny0, nx1, ny1
-            if apply_roi_to_all:
-                print(f"  ROI locked at offset "
-                      f"({cur_roi_x0 - base_roi_x0:+d}, "
-                      f"{cur_roi_y0 - base_roi_y0:+d}) px "
-                      f"for all remaining images.")
+        # Auto-align: template-match the baseline ROI region in this image.
+        preview_gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
+        dx, dy, confidence = auto_align_to_baseline(
+            baseline_gray, preview_gray,
+            base_roi_x0, base_roi_y0, base_roi_x1, base_roi_y1,
+        )
 
-        # Build the per-image mask from the (possibly adjusted) rectangle.
+        if confidence < ALIGN_MIN_CONFIDENCE:
+            print(f"  [warning] Low alignment confidence ({confidence:.2f}) for {fname}. "
+                  f"Results may be unreliable.")
+
+        # Apply offset to get per-image ROI position
+        cur_roi_x0 = base_roi_x0 + dx
+        cur_roi_y0 = base_roi_y0 + dy
+        cur_roi_x1 = base_roi_x1 + dx
+        cur_roi_y1 = base_roi_y1 + dy
+        print(f"  Auto-aligned: offset ({dx:+d}, {dy:+d}) px, confidence={confidence:.3f}")
+
+        # Build the per-image mask from the auto-aligned rectangle.
         sample_mask, sample_roi_params = rect_to_roi(
             cur_roi_x0, cur_roi_y0, cur_roi_x1, cur_roi_y1, img_h, img_w
         )
