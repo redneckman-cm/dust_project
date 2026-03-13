@@ -2181,25 +2181,39 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         writer.writeheader()
         writer.writerows(rows)
 
-    # --- Master CSV (append) ---
-    master_csv = os.path.join(out_root, "master_dust_results.csv")
-    master_exists = os.path.exists(master_csv)
+    # --- Master Excel workbook (append) ---
+    master_xlsx = os.path.join(out_root, "master_dust_results.xlsx")
+    try:
+        import openpyxl as _openpyxl
+    except ImportError:
+        import subprocess as _sp, sys as _sys
+        print("[info] Installing openpyxl for Excel output...")
+        _sp.check_call([_sys.executable, "-m", "pip", "install", "openpyxl", "-q"])
+        import openpyxl as _openpyxl
 
-    if master_exists:
+    if os.path.exists(master_xlsx):
         try:
-            with open(master_csv, "r", newline="") as f_master:
-                first_line = f_master.readline()
-            if "iod" not in first_line:
-                print("[warning] Existing master_dust_results.csv uses an older schema. "
+            _wb = _openpyxl.load_workbook(master_xlsx)
+            _ws = _wb.active
+            _header = [c.value for c in _ws[1]]
+            if "iod" not in _header:
+                print("[warning] Existing master_dust_results.xlsx uses an older schema. "
                       "Consider deleting or archiving it so a new file with the v0.7.5 header can be created.")
         except Exception as e:
-            print(f"[warning] Could not inspect master_dust_results.csv header: {e}")
-            
-    with open(master_csv, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not master_exists:
-            writer.writeheader()
-        writer.writerows(rows)
+            print(f"[warning] Could not open master_dust_results.xlsx: {e}. Creating new file.")
+            _wb = _openpyxl.Workbook()
+            _ws = _wb.active
+            _ws.title = "Dust Results"
+            _ws.append(fieldnames)
+    else:
+        _wb = _openpyxl.Workbook()
+        _ws = _wb.active
+        _ws.title = "Dust Results"
+        _ws.append(fieldnames)
+
+    for _row in rows:
+        _ws.append([_row[f] for f in fieldnames])
+    _wb.save(master_xlsx)
 
     # Generate HTML report (unchanged, still uses original results)
     report_path = generate_sample_report(sample_dir, sample_name, results, moved_images,
@@ -2212,7 +2226,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     print(f"  CSV:   {os.path.basename(csv_path)}")
     print(f"  Plot:  dust_plot_{sample_name}.png")
     print(f"  HTML:  {os.path.basename(report_path)}")
-    print(f"Master CSV updated: {os.path.basename(master_csv)}")
+    print(f"Master XLSX updated: {os.path.basename(master_xlsx)}")
 
     return results
 
