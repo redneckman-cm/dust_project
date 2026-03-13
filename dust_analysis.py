@@ -80,7 +80,7 @@ except Exception:
 # =========================
 # TOOL VERSION
 # =========================
-TOOL_VERSION = "0.7.7"  # Channel-dependent BASELINE_MIN_STD floor for L* detection
+TOOL_VERSION = "0.8.0"  # Per-pixel image subtraction — substrate-agnostic detection
 
 # =========================
 # GLOBAL TUNING CONSTANTS
@@ -105,15 +105,17 @@ BASELINE_SIGMA_K = 0.25        # smaller K => more sensitive to darker-than-base
 BASELINE_MIN_ABS_DELTA = 0.4   # allow moderately darker specks/shadows to count as dust
 BASELINE_LOCAL_PERCENTILE = 85.0  # slightly lower so more local-contrast specks qualify
 
-# Minimum baseline standard deviation (LAB colour space).
-# If the surface is very uniform the measured std can be so small that
-# the sigma threshold catches camera noise or minor WB drift.  This floor
-# ensures a meaningful minimum absolute channel drop is required for detection.
-# b* (coloured substrates) has a narrow range (~30-50), so 1.5 is appropriate.
-# L* (clear/grey substrates) has a much wider range (~170-220), so a larger
-# floor is needed to avoid flagging everything as dust.
-BASELINE_MIN_STD = 1.5       # floor for b* channel
-BASELINE_MIN_STD_LSTAR = 5.0 # floor for L* channel
+# Per-pixel subtraction mode constants (v0.8.0+).
+# Minimum std for the calibration ROI L* channel — prevents the noise floor
+# from collapsing to near-zero on extremely uniform calibration patches.
+SUBTRACTION_MIN_STD = 3.0
+# Minimum calibration L* value for per-pixel IOD normalisation.
+# Prevents division-by-zero in dark regions of the calibration image.
+SUBTRACTION_MIN_CAL_LSTAR = 10.0
+
+# Legacy channel-dependent std floors (v0.7.x, kept for reference):
+# BASELINE_MIN_STD = 1.5       # was floor for b* channel
+# BASELINE_MIN_STD_LSTAR = 5.0 # was floor for L* channel
 
 # Sigma multipliers for the two detection metrics.
 # IOD uses a sensitive 3-sigma floor to catch even fine dust layers.
@@ -123,11 +125,8 @@ BASELINE_MIN_STD_LSTAR = 5.0 # floor for L* channel
 IOD_SIGMA = 3.0
 PAC_SIGMA = 5.0
 
-# Auto-detection threshold for substrate colour.
-# If |mean b*| of the baseline ROI exceeds this value, the disc is "coloured"
-# (e.g. orange Kapton) and b* is used for detection.  Otherwise the disc is
-# treated as clear/grey and L* (lightness) is used instead.
-B_STAR_THRESHOLD = 10.0
+# Legacy auto-detection threshold (v0.7.x, kept for reference):
+# B_STAR_THRESHOLD = 10.0  # was: if |mean b*| > threshold → coloured, else clear
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".nef")
 
@@ -1143,27 +1142,26 @@ def interactive_roi_nudge(image_bgr, x0, y0, x1, y1, image_name=""):
 # DUST MEASUREMENT
 # =========================
 
-def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=None):
+def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=None, cal_roi_2d=None):
     """
     Compute a dust metric inside the ROI.
 
     When baseline_stats is None: local-contrast percentile method (no baseline image).
 
-    When baseline_stats is provided: LAB b*-channel IOD method.
-      baseline_stats holds (mean_b*, std_b*) from the clean reference image.
-      b* (Yellow-Blue axis) isolates the colour-shift caused by achromatic dust
-      on a yellow substrate; illumination flicker changes L* but not b*.
-      1. delta = base_b*_mean - pixel_b*  (positive = less yellow than baseline)
-      2. 3-sigma noise floor: delta = 0 where delta < 3 * base_b*_std
-      3. colour_shift = delta / base_b*_mean  (clamped to [0, 1])
-      4. mean_colour_shift = sum(colour_shift) / total_roi_pixels
+    When baseline_stats is provided (v0.8.0+, image-subtraction mode):
+      Per-pixel subtraction of calibration L* from dusted L*.  The substrate
+      cancels out, leaving only the dust signal.
+      1. delta = cal_L*[x,y] - dust_L*[x,y]   (positive = dust present)
+      2. Noise floor: delta = 0 where delta < IOD_SIGMA * base_std
+      3. opacity = delta / max(cal_L*[x,y], 10)   (clamped to [0, 1])
+      4. IOD = mean(opacity) across the entire ROI
 
     Returns:
       metric, dust_pixels, total_pixels, dust_binary, dust_score, pac, pac_dust_pixels
       metric         = dust_fraction (no-baseline mode) or mean_opacity (IOD mode)
       dust_score     = per-pixel float32 opacity map (used for red heatmap visualization)
       pac            = Percent Area Coverage (baseline mode only; 0.0 in no-baseline mode)
-      pac_dust_pixels = count of pixels classified as dust by the 3-sigma PAC threshold
+      pac_dust_pixels = count of pixels classified as dust by the PAC_SIGMA threshold
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     roi = (mask_roi == 255)
@@ -1190,7 +1188,7 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
         dust_pixels = np.count_nonzero(dust_binary == 255)
         dust_fraction = dust_pixels / float(total_pixels)
 
-        # New: compute dust_score as (diff - thresh), clipped to >=0, float32, and zero outside ROI
+        # Compute dust_score as (diff - thresh), clipped to >=0, float32, and zero outside ROI
         diff_f = diff.astype(np.float32)
         dust_score = diff_f - float(thresh)
         dust_score[dust_score < 0] = 0
@@ -1198,54 +1196,99 @@ def measure_dust(image_bgr, mask_roi, baseline_stats=None, dark_thresh_override=
 
         return dust_fraction, dust_pixels, total_pixels, dust_binary, dust_score, 0.0, 0
     else:
-        # Channel-adaptive IOD approach.
-        # baseline_stats = (mean, std, channel) from pick_baseline_from_image().
-        # channel is "b*" for coloured substrates, "L*" for clear/grey ones.
-        if len(baseline_stats) >= 3:
+        # Unpack baseline_stats (4-tuple from v0.8.0+, backward compat with 2/3-tuple)
+        if len(baseline_stats) >= 4:
+            base_mean, base_std, channel, _cal_from_stats = baseline_stats
+        elif len(baseline_stats) >= 3:
             base_mean, base_std, channel = baseline_stats
         else:
             base_mean, base_std = baseline_stats
-            channel = "b*"  # backward compat
+            channel = "L*"
 
         if base_std < 1e-3:
-            base_std = 1.0
+            base_std = SUBTRACTION_MIN_STD
 
+        # Convert dusted image to LAB L*
         lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-        if channel == "b*":
-            ch_f = lab[:, :, 2].astype(np.float32) - 128.0  # b*: -128 to +127
-        else:  # "L*"
-            ch_f = lab[:, :, 0].astype(np.float32)           # L*: 0-255
+        dust_l = lab[:, :, 0].astype(np.float32)  # L*: 0-255
 
-        # Step 1: Per-pixel drop — positive where pixel is lower than baseline.
-        delta = (base_mean - ch_f).astype(np.float32)
+        # Extract the ROI bounding rectangle from the dusted image
+        ys, xs = np.where(roi)
+        rx0, rx1 = int(xs.min()), int(xs.max())
+        ry0, ry1 = int(ys.min()), int(ys.max())
+        dust_roi_2d = dust_l[ry0:ry1 + 1, rx0:rx1 + 1]
 
-        # Step 2: IOD_SIGMA noise floor — suppress sensor noise and minor drift.
-        noise_floor = IOD_SIGMA * base_std
-        delta[delta < noise_floor] = 0.0
-        delta[~roi] = 0.0
+        # Build crop-local ROI mask (True inside ROI rectangle)
+        crop_mask = mask_roi[ry0:ry1 + 1, rx0:rx1 + 1] == 255
 
-        # Step 3: Normalise by baseline mean → per-pixel Score in [0,1].
-        if base_mean > 1e-3:
-            opacity = np.clip(delta / base_mean, 0.0, 1.0).astype(np.float32)
+        if cal_roi_2d is not None and cal_roi_2d.shape == dust_roi_2d.shape:
+            # ===== Per-pixel image subtraction (v0.8.0) =====
+
+            # Step 1: Per-pixel difference — positive where cal is brighter (dust present)
+            delta_2d = (cal_roi_2d - dust_roi_2d).astype(np.float32)
+
+            # Step 2: IOD_SIGMA noise floor — suppress sensor noise
+            noise_floor = IOD_SIGMA * base_std
+            delta_2d[delta_2d < noise_floor] = 0.0
+            delta_2d[~crop_mask] = 0.0
+
+            # Step 3: Per-pixel normalisation — opacity = delta / cal_value
+            cal_safe = np.maximum(cal_roi_2d, SUBTRACTION_MIN_CAL_LSTAR)
+            opacity_2d = np.clip(delta_2d / cal_safe, 0.0, 1.0).astype(np.float32)
+            opacity_2d[~crop_mask] = 0.0
+
+            # Step 4: Expand back to full image size for visualisation compatibility
+            opacity = np.zeros(image_bgr.shape[:2], dtype=np.float32)
+            opacity[ry0:ry1 + 1, rx0:rx1 + 1] = opacity_2d
+
+            # IOD metric: mean opacity across entire ROI
+            mean_opacity = float(np.sum(opacity_2d[crop_mask]) / total_pixels)
+
+            # dust_binary: pixels that cleared the noise floor
+            dust_binary = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+            dust_binary_crop = (opacity_2d > 0).astype(np.uint8) * 255
+            dust_binary[ry0:ry1 + 1, rx0:rx1 + 1] = dust_binary_crop
+            dust_pixels = np.count_nonzero(dust_binary == 255)
+
+            # dust_score: per-pixel map for the red heatmap renderer
+            dust_score = opacity
+
+            # PAC: stricter threshold on the raw difference image
+            pac_floor = PAC_SIGMA * base_std
+            raw_delta_2d = (cal_roi_2d - dust_roi_2d).astype(np.float32)
+            is_dust_2d = (raw_delta_2d > pac_floor) & crop_mask
+            pac_dust_pixels = int(np.count_nonzero(is_dust_2d))
+            pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
+
         else:
-            opacity = np.zeros_like(delta, dtype=np.float32)
+            # Fallback: scalar subtraction (if cal_roi_2d missing or shape mismatch)
+            if cal_roi_2d is not None:
+                print(f"  [warning] Calibration ROI shape {cal_roi_2d.shape} != "
+                      f"dusted ROI shape {dust_roi_2d.shape}. Falling back to scalar mode.")
 
-        # Step 4: Mean Score across the entire ROI — the IOD metric.
-        mean_opacity = float(np.sum(opacity) / total_pixels)
+            # Per-pixel drop vs global mean (legacy approach)
+            delta = (base_mean - dust_l).astype(np.float32)
+            noise_floor = IOD_SIGMA * base_std
+            delta[delta < noise_floor] = 0.0
+            delta[~roi] = 0.0
 
-        # dust_binary: pixels that cleared the noise floor (for visualization overlay).
-        dust_binary = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
-        dust_binary[opacity > 0] = 255
-        dust_pixels = np.count_nonzero(dust_binary == 255)
+            if base_mean > 1e-3:
+                opacity = np.clip(delta / base_mean, 0.0, 1.0).astype(np.float32)
+            else:
+                opacity = np.zeros_like(delta, dtype=np.float32)
 
-        # dust_score: per-pixel map for the red heatmap renderer.
-        dust_score = opacity
+            mean_opacity = float(np.sum(opacity) / total_pixels)
 
-        # PAC (Percent Area Coverage): stricter PAC_SIGMA threshold.
-        dust_threshold = base_mean - (PAC_SIGMA * base_std)
-        is_dust = (ch_f < dust_threshold) & roi
-        pac_dust_pixels = int(np.count_nonzero(is_dust))
-        pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
+            dust_binary = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+            dust_binary[opacity > 0] = 255
+            dust_pixels = np.count_nonzero(dust_binary == 255)
+
+            dust_score = opacity
+
+            dust_threshold = base_mean - (PAC_SIGMA * base_std)
+            is_dust = (dust_l < dust_threshold) & roi
+            pac_dust_pixels = int(np.count_nonzero(is_dust))
+            pac = max(0.0, pac_dust_pixels / float(total_pixels) * 100.0)
 
         return mean_opacity, dust_pixels, total_pixels, dust_binary, dust_score, pac, pac_dust_pixels
 
@@ -1330,45 +1373,39 @@ def compute_pre(results_list):
 def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (untreated sample)", patch_radius=10, use_full_roi=False):
     """
     Let the user click on one or more CLEAN regions of the UNTREATED sample to define
-    a baseline reference.  The function auto-detects the substrate colour:
+    a baseline reference.  Always uses LAB L* (lightness) for substrate-agnostic
+    per-pixel image subtraction (v0.8.0+).
 
-    - **Coloured substrates** (|mean b*| > B_STAR_THRESHOLD): uses LAB b*
-      (Yellow-Blue axis).  b* is insensitive to surface rugosity (which
-      affects L*), so the mean of a clean orange disc is a stable reference.
-    - **Clear / grey substrates** (|mean b*| ≤ threshold): uses LAB L*
-      (lightness).  Clear discs have no colour signal, but dust darkens L*.
-
-    The std is clamped to BASELINE_MIN_STD to reject sensor noise on very
+    The std is clamped to SUBTRACTION_MIN_STD to reject sensor noise on very
     uniform surfaces.
 
     When use_full_roi=True, skips interactive selection and uses ALL ROI pixels.
 
     Returns:
-      (baseline_mean, baseline_std, channel_name)
-      where channel_name is "b*" or "L*"
+      (baseline_mean, baseline_std, "L*", cal_roi_2d)
+      where cal_roi_2d is a 2D float32 array of L* values cropped to the ROI
+      bounding rectangle (shape = roi_height × roi_width).
     """
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-    b_channel = lab[:, :, 2].astype(np.float32) - 128.0  # real b*: -128 to +127
     l_channel = lab[:, :, 0].astype(np.float32)           # L*: 0-255 (OpenCV scale)
 
+    # Extract the rectangular bounding box of the ROI for the 2D calibration crop.
+    ys_all, xs_all = np.where(mask_roi == 255)
+    if ys_all.size == 0:
+        raise RuntimeError("ROI has zero pixels in blank reference image.")
+    roi_x0, roi_x1 = int(xs_all.min()), int(xs_all.max())
+    roi_y0, roi_y1 = int(ys_all.min()), int(ys_all.max())
+    cal_roi_2d = l_channel[roi_y0:roi_y1 + 1, roi_x0:roi_x1 + 1].copy()
+
     if use_full_roi:
-        b_roi = b_channel[mask_roi == 255]
-        if b_roi.size == 0:
-            raise RuntimeError("ROI has zero pixels in blank reference image.")
-        mean_b = float(np.mean(b_roi))
-        if abs(mean_b) > B_STAR_THRESHOLD:
-            channel = "b*"
-            roi_pixels = b_roi
-        else:
-            channel = "L*"
-            roi_pixels = l_channel[mask_roi == 255]
+        roi_pixels = l_channel[mask_roi == 255]
         baseline_mean = float(np.mean(roi_pixels))
-        std_floor = BASELINE_MIN_STD if channel == "b*" else BASELINE_MIN_STD_LSTAR
-        baseline_std = max(float(np.std(roi_pixels)), std_floor)
-        print(f"  Auto-detected substrate → {channel} channel")
-        print(f"  Full-ROI blank calibration (LAB {channel}): {roi_pixels.size} pixels, mean {channel}={baseline_mean:.2f}, std={baseline_std:.2f}")
-        return baseline_mean, baseline_std, channel
-    h, w = b_channel.shape
+        baseline_std = max(float(np.std(roi_pixels)), SUBTRACTION_MIN_STD)
+        print(f"  Subtraction mode → L* channel (lightness)")
+        print(f"  Full-ROI blank calibration: {roi_pixels.size} pixels, mean L*={baseline_mean:.2f}, std={baseline_std:.2f}")
+        print(f"  Calibration crop: {cal_roi_2d.shape[1]}×{cal_roi_2d.shape[0]} px")
+        return baseline_mean, baseline_std, "L*", cal_roi_2d
+    h, w = l_channel.shape
 
     # Scale instruction font size with image size (larger text)
     min_dim = min(h, w)
@@ -1563,12 +1600,11 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
 
     cv2.destroyWindow(window_name)
 
-    # Auto-detect substrate colour from b* of clicked patches (or full ROI fallback)
-    # First, always collect b* pixels to decide the channel
+    # Collect L* pixels from clicked patches (or full ROI if user cancelled)
     if not baseline_points:
-        b_roi_pixels = b_channel[mask_roi == 255]
+        roi_pixels = l_channel[mask_roi == 255]
     else:
-        collected_b = []
+        collected_l = []
         for (x_f, y_f) in baseline_points:
             x = int(round(x_f))
             y = int(round(y_f))
@@ -1576,44 +1612,19 @@ def pick_baseline_from_image(image_bgr, mask_roi, window_name="Select baseline (
             x1 = min(w, x + patch_radius + 1)
             y0 = max(0, y - patch_radius)
             y1 = min(h, y + patch_radius + 1)
-            patch = b_channel[y0:y1, x0:x1]
+            patch = l_channel[y0:y1, x0:x1]
             patch_mask = mask_roi[y0:y1, x0:x1] == 255
             pp = patch[patch_mask]
             if pp.size > 0:
-                collected_b.append(pp.ravel())
-        b_roi_pixels = np.concatenate(collected_b, axis=0) if collected_b else b_channel[mask_roi == 255]
-
-    mean_b = float(np.mean(b_roi_pixels))
-    if abs(mean_b) > B_STAR_THRESHOLD:
-        channel = "b*"
-        roi_pixels = b_roi_pixels
-    else:
-        channel = "L*"
-        # Re-collect from L* channel
-        if not baseline_points:
-            roi_pixels = l_channel[mask_roi == 255]
-        else:
-            collected_l = []
-            for (x_f, y_f) in baseline_points:
-                x = int(round(x_f))
-                y = int(round(y_f))
-                x0 = max(0, x - patch_radius)
-                x1 = min(w, x + patch_radius + 1)
-                y0 = max(0, y - patch_radius)
-                y1 = min(h, y + patch_radius + 1)
-                patch = l_channel[y0:y1, x0:x1]
-                patch_mask = mask_roi[y0:y1, x0:x1] == 255
-                pp = patch[patch_mask]
-                if pp.size > 0:
-                    collected_l.append(pp.ravel())
-            roi_pixels = np.concatenate(collected_l, axis=0) if collected_l else l_channel[mask_roi == 255]
+                collected_l.append(pp.ravel())
+        roi_pixels = np.concatenate(collected_l, axis=0) if collected_l else l_channel[mask_roi == 255]
 
     baseline_mean = float(np.mean(roi_pixels))
-    std_floor = BASELINE_MIN_STD if channel == "b*" else BASELINE_MIN_STD_LSTAR
-    baseline_std = max(float(np.std(roi_pixels)), std_floor)
-    print(f"  Auto-detected substrate → {channel} channel (mean b*={mean_b:.1f})")
+    baseline_std = max(float(np.std(roi_pixels)), SUBTRACTION_MIN_STD)
+    print(f"  Subtraction mode → L* channel (lightness)")
+    print(f"  Calibration crop: {cal_roi_2d.shape[1]}×{cal_roi_2d.shape[0]} px")
 
-    return baseline_mean, baseline_std, channel
+    return baseline_mean, baseline_std, "L*", cal_roi_2d
 
 
 # =========================
@@ -1704,7 +1715,7 @@ def create_cropped_highlight_with_footer(overlay_bgr, circle, sample_name, image
 def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_override=None, debug=False,
                          sample_name=None, spin_step=None, timestamp_str=None,
                          precomputed_mask_roi=None, precomputed_roi_params=None,
-                         rotation_angle=0.0):
+                         rotation_angle=0.0, cal_roi_2d=None):
     """
     Process a single image:
       - apply the batch rotation angle (set interactively on the baseline)
@@ -1748,6 +1759,7 @@ def process_single_image(img_path, out_dir, baseline_stats=None, dark_thresh_ove
         mask_roi,
         baseline_stats=baseline_stats,
         dark_thresh_override=dark_thresh_override,
+        cal_roi_2d=cal_roi_2d,
     )
 
     # Continuous dust intensity metric: average dust_score inside ROI.
@@ -1986,10 +1998,10 @@ def generate_sample_report(sample_dir, sample_name, results, moved_images, blank
   <h1>Dust Report – {sample_name}</h1>
   <p style="color:#555; font-size:0.9em;">
     Tool version {TOOL_VERSION}. &nbsp;
-    <strong>Detection:</strong> LAB {detection_channel} {"(Yellow&ndash;Blue axis) &mdash; isolates colour loss caused by achromatic dust on a coloured substrate" if detection_channel == "b*" else "(Lightness) &mdash; isolates darkening caused by dust on a clear/grey substrate"}. &nbsp;
-    <strong>Baseline:</strong> {"mean " + detection_channel + " of full ROI from blank reference image (Step 0, not measured)." if blank_calibration else "mean " + detection_channel + " from manually selected clean patches on the last image."} &nbsp;
-    <strong>IOD threshold:</strong> baseline {detection_channel} &minus; {IOD_SIGMA:.0f}&sigma; (continuous metric). &nbsp;
-    <strong>PAC threshold:</strong> baseline {detection_channel} &minus; {PAC_SIGMA:.0f}&sigma; (binary area classification). &nbsp;
+    <strong>Detection:</strong> Per-pixel image subtraction on LAB L* (lightness). The clean calibration image is subtracted from each dusted image, cancelling substrate colour and isolating the dust signal. &nbsp;
+    <strong>Baseline:</strong> {"L* of full ROI from blank reference image (Step 0, not measured)." if blank_calibration else "L* from manually selected clean patches on the untreated sample."} &nbsp;
+    <strong>IOD threshold:</strong> calibration L* &minus; dusted L* &gt; {IOD_SIGMA:.0f}&sigma; noise floor (continuous metric). &nbsp;
+    <strong>PAC threshold:</strong> calibration L* &minus; dusted L* &gt; {PAC_SIGMA:.0f}&sigma; noise floor (binary area classification). &nbsp;
     <strong>PRE:</strong> Particle Removal Efficiency relative to Step 0 (first dusted image, no spin).
   </p>
 
@@ -2098,16 +2110,19 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
     else:
         # Let user interactively select a clean reference region on the untreated sample
         baseline_stats = pick_baseline_from_image(baseline_image, baseline_mask)
-    print(f"Baseline stats (P90, std): {baseline_stats[0]:.2f}, {baseline_stats[1]:.2f}")
 
-    # IOD mode: noise floor is always 3 × base_std, computed inside measure_dust.
+    # Unpack 4-tuple: (mean, std, "L*", cal_roi_2d)
+    base_mean, base_std, det_channel, cal_roi_2d = baseline_stats
+
+    # IOD mode: noise floor is always IOD_SIGMA × base_std, computed inside measure_dust.
     # No separate threshold calibration step needed.
     baseline_dark_thresh = None  # unused in IOD mode; kept for API compatibility
-    det_channel = baseline_stats[2] if len(baseline_stats) >= 3 else "b*"
-    print(f"\nBaseline {det_channel}: mean={baseline_stats[0]:.2f}, std={baseline_stats[1]:.2f}")
-    print(f"  IOD noise floor: {IOD_SIGMA:.0f}σ = {IOD_SIGMA * baseline_stats[1]:.3f} {det_channel} units")
-    print(f"  PAC threshold:   {PAC_SIGMA:.0f}σ = {PAC_SIGMA * baseline_stats[1]:.3f} {det_channel} units below baseline")
-    print("  Pixels below threshold are measured; a clean image returns mean_opacity = 0.0")
+    print(f"\nSubtraction mode (L* channel)")
+    print(f"  Calibration ROI: mean L*={base_mean:.2f}, std={base_std:.2f}")
+    print(f"  Calibration crop: {cal_roi_2d.shape[1]}×{cal_roi_2d.shape[0]} px")
+    print(f"  IOD noise floor: {IOD_SIGMA:.0f}σ = {IOD_SIGMA * base_std:.3f} L* units")
+    print(f"  PAC threshold:   {PAC_SIGMA:.0f}σ = {PAC_SIGMA * base_std:.3f} L* units")
+    print("  Per-pixel calibration subtraction; a clean image returns mean_opacity ≈ 0.0")
 
     out_root = "results"
     os.makedirs(out_root, exist_ok=True)
@@ -2180,6 +2195,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
             rotation_angle=rotation_angle,
             precomputed_mask_roi=sample_mask,
             precomputed_roi_params=sample_roi_params,
+            cal_roi_2d=cal_roi_2d,
         )
         results.append(res)
 
@@ -2252,8 +2268,7 @@ def process_folder(folder, sample_name, debug_first=False, baseline_from_last=Fa
         _ws.append([_row[f] for f in fieldnames])
     _wb.save(master_xlsx)
 
-    # Generate HTML report (unchanged, still uses original results)
-    det_channel = baseline_stats[2] if len(baseline_stats) >= 3 else "b*"
+    # Generate HTML report
     report_path = generate_sample_report(sample_dir, sample_name, results, moved_images,
                                          blank_calibration=blank_calibration,
                                          detection_channel=det_channel)
